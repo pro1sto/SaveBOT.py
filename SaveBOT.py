@@ -63,7 +63,7 @@ def remove_users_bulk(user_ids: list[int]):
         conn.executemany("DELETE FROM users WHERE user_id = ?", [(uid,) for uid in user_ids])
 
 
-# --- 3. МОМЕНТАЛЬНЫЙ TIKTOK (1-2 СЕКУНДЫ) ---
+# --- 3. БЫСТРЫЙ TIKTOK ---
 async def get_tiktok_fast(url: str) -> str | None:
     api_url = "https://tikwm.com"
     try:
@@ -72,13 +72,16 @@ async def get_tiktok_fast(url: str) -> str | None:
                 if resp.status == 200:
                     data = await resp.json()
                     if data.get("code") == 0 and data.get("data"):
-                        return data["data"].get("play")
+                        play_url = data["data"].get("play")
+                        if play_url and play_url.startswith("/"):
+                            return "https://tikwm.com" + play_url
+                        return play_url
     except Exception as e:
         logging.error(f"Ошибка быстрого API TikTok: {e}")
     return None
 
 
-# --- 4. БЫСТРЫЙ INSTAGRAM БЕЗ ПЕРЕКОДИРОВКИ ---
+# --- 4. УНИВЕРСАЛЬНОЕ СКАЧИВАНИЕ (ДЛЯ ВСЕХ ССЫЛОК) ---
 def download_fast_ytdlp(url: str) -> dict | None:
     file_id = uuid.uuid4().hex
     output_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp4")
@@ -86,7 +89,8 @@ def download_fast_ytdlp(url: str) -> dict | None:
     ydl_opts = {
         "outtmpl": output_path,
         "ffmpeg_location": FFMPEG_PATH,
-        "format": "bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/b[vcodec^=avc1][ext=mp4]/b[ext=mp4]/b",
+        # Универсальный формат: берём любой лучший поток без жёсткого ограничения по кодеку
+        "format": "bv*+ba/b",
         "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
@@ -246,6 +250,7 @@ async def handle_link(message: types.Message):
 
     status_msg = await message.answer("⚡ Загружаю...")
 
+    # 1. Пробуем быстрое API для TikTok
     if "tiktok.com" in lower_url:
         direct_video_url = await get_tiktok_fast(url)
         if direct_video_url:
@@ -258,8 +263,9 @@ async def handle_link(message: types.Message):
                 await status_msg.delete()
                 return
             except Exception as e:
-                logging.warning(f"Прямая отправка TikTok не прошла, переключаюсь на yt-dlp: {e}")
+                logging.warning(f"Прямая отправка TikTok не прошла, качаю через yt-dlp: {e}")
 
+    # 2. Запасной/основной метод через yt-dlp без тяжёлой перекодировки
     video_data = await asyncio.to_thread(download_fast_ytdlp, url)
 
     if not video_data:
@@ -300,8 +306,5 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logging.info("Бот остановлен.")
+
 
