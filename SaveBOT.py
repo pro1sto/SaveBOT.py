@@ -35,21 +35,23 @@ is_sending = False
 # --- 2. БАЗА ДАННЫХ (С АВТОИМПОРТОМ ИЗ ПАПКИ) ---
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
-        # Включаем WAL-режим, чтобы база работала быстро и не блокировалась при большой нагрузке
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)")
 
-        # Способ 1: Если вы загрузили файл 103664_users.txt в папку бота на Bothost,
-        # при запуске он автоматически зальёт всех юзеров в базу и удалит текстовый файл
         txt_path = os.path.join(BASE_DIR, "103664_users.txt")
         if os.path.exists(txt_path):
             logging.info("Найден файл 103664_users.txt — начинаю автоимпорт...")
             with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
-                ids = [(int(m),) for m in re.findall(r"\b\d{5,15}\b", f.read())]
+                # Ищем все последовательности цифр от 5 до 15 знаков без привязки к пробелам
+                ids = [(int(m),) for m in re.findall(r"\d{5,15}", f.read())]
             if ids:
                 conn.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", ids)
-                logging.info(f"Успешно импортировано записей: {len(ids)}")
-            os.remove(txt_path)
+                logging.info(f"Успешно обработано ID: {len(ids)}")
+            # Переименовываем файл вместо удаления, чтобы не потерять его
+            done_path = os.path.join(BASE_DIR, "103664_users_done.txt")
+            if os.path.exists(done_path):
+                os.remove(done_path)
+            os.rename(txt_path, done_path)
 
 
 def add_user(user_id: int):
@@ -151,7 +153,7 @@ def download_and_fix_video(url: str) -> dict | None:
     return None
 
 
-# --- 4. СПОСОБ 2: ИМПОРТ БАЗЫ ОТПРАВКОЙ ФАЙЛА В TELEGRAM ---
+# --- 4. ИМПОРТ БАЗЫ ОТПРАВКОЙ ФАЙЛА В TELEGRAM ---
 @dp.message(F.document)
 async def import_txt_db(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -172,7 +174,7 @@ async def import_txt_db(message: types.Message):
         with open(temp_txt, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
 
-        found_ids = [int(match) for match in re.findall(r"\b\d{5,15}\b", content)]
+        found_ids = [int(match) for match in re.findall(r"\d{5,15}", content)]
         if not found_ids:
             await wait_msg.edit_text("❌ В файле не найдено числовых ID.")
             return
@@ -295,5 +297,3 @@ async def start_cmd(message: types.Message):
     add_user(message.from_user.id)
     await message.answer(
         "📥 **Бот для скачивания видео из TikTok и Instagram**\n\n"
-
-
