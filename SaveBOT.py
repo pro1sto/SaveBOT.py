@@ -1,5 +1,4 @@
 import os
-import re
 import asyncio
 import logging
 import sqlite3
@@ -47,14 +46,14 @@ def add_user(user_id: int):
 
 def get_users_count() -> int:
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute("SELECT COUNT(*) FROM users").fetchone()
-        return row[0] if row else 0
+        for (count,) in conn.execute("SELECT COUNT(*) FROM users"):
+            return count
+    return 0
 
 
 def get_all_users() -> list[int]:
     with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute("SELECT user_id FROM users")
-        return [row[0] for row in cursor.fetchall()]
+        return [uid for (uid,) in conn.execute("SELECT user_id FROM users")]
 
 
 def remove_users_bulk(user_ids: list[int]):
@@ -64,7 +63,7 @@ def remove_users_bulk(user_ids: list[int]):
         conn.executemany("DELETE FROM users WHERE user_id = ?", [(uid,) for uid in user_ids])
 
 
-# --- 3. МОМЕНТАЛЬНЫЙ СПОСОБ ДЛЯ TIKTOK (1-2 СЕКУНДЫ) ---
+# --- 3. МОМЕНТАЛЬНЫЙ TIKTOK (1-2 СЕКУНДЫ) ---
 async def get_tiktok_fast(url: str) -> str | None:
     api_url = "https://tikwm.com"
     try:
@@ -79,7 +78,7 @@ async def get_tiktok_fast(url: str) -> str | None:
     return None
 
 
-# --- 4. БЫСТРЫЙ СПОСОБ ДЛЯ INSTAGRAM (СКЛЕЙКА БЕЗ ПЕРЕКОДИРОВКИ) ---
+# --- 4. БЫСТРЫЙ INSTAGRAM БЕЗ ПЕРЕКОДИРОВКИ ---
 def download_fast_ytdlp(url: str) -> dict | None:
     file_id = uuid.uuid4().hex
     output_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp4")
@@ -135,16 +134,6 @@ async def stats_cmd(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
     await message.answer(f"📊 Живых пользователей в базе: **{get_users_count()}**", parse_mode="Markdown")
-
-
-@dp.message(Command("backup"))
-async def backup_cmd(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    if os.path.exists(DB_PATH):
-        await message.answer_document(FSInputFile(DB_PATH), caption="💾 Резервная копия базы пользователей")
-    else:
-        await message.answer("❌ Файл базы данных пока не найден.")
 
 
 @dp.message(Command("stop_send"))
@@ -225,7 +214,6 @@ async def send_cmd(message: types.Message):
         remove_users_bulk(dead_batch)
 
     is_sending = False
-    # Отправляем финальный отчёт новым сообщением, чтобы он гарантированно пришёл даже спустя 1.5 часа
     await message.answer(
         f"✅ **Рассылка завершена!**\n\n"
         f"📨 Доставлено живым: **{success}**\n"
@@ -301,3 +289,19 @@ async def handle_link(message: types.Message):
         await status_msg.edit_text("❌ Ошибка при отправке видео в Telegram.")
     finally:
         if os.path.exists(file_path):
+            os.remove(file_path)
+
+
+# --- 7. ЗАПУСК ---
+async def main():
+    init_db()
+    await bot.delete_webhook(drop_pending_updates=True)
+    logging.info("Турбо-загрузчик запущен!")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Бот остановлен.")
+
