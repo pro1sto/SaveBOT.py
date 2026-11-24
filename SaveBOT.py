@@ -4,7 +4,7 @@ import asyncio
 import logging
 import sqlite3
 import uuid
-import subprocess
+import aiohttp
 import yt_dlp
 import imageio_ffmpeg
 from aiogram import Bot, Dispatcher, types, F
@@ -26,32 +26,18 @@ dp = Dispatcher()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "downloader_users.db")
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "temp_videos")
+COOKIES_PATH = os.path.join(BASE_DIR, "cookies.txt")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 is_sending = False
 
 
-# --- 2. БАЗА ДАННЫХ (С АВТОИМПОРТОМ ИЗ ПАПКИ) ---
+# --- 2. БАЗА ДАННЫХ ---
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)")
-
-        txt_path = os.path.join(BASE_DIR, "103664_users.txt")
-        if os.path.exists(txt_path):
-            logging.info("Найден файл 103664_users.txt — начинаю автоимпорт...")
-            with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
-                # Ищем все последовательности цифр от 5 до 15 знаков без привязки к пробелам
-                ids = [(int(m),) for m in re.findall(r"\d{5,15}", f.read())]
-            if ids:
-                conn.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", ids)
-                logging.info(f"Успешно обработано ID: {len(ids)}")
-            # Переименовываем файл вместо удаления, чтобы не потерять его
-            done_path = os.path.join(BASE_DIR, "103664_users_done.txt")
-            if os.path.exists(done_path):
-                os.remove(done_path)
-            os.rename(txt_path, done_path)
 
 
 def add_user(user_id: int):
@@ -59,17 +45,10 @@ def add_user(user_id: int):
         conn.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
 
 
-def add_users_bulk(user_ids: list[int]) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
-        before = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        conn.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in user_ids])
-        after = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        return after - before
-
-
 def get_users_count() -> int:
     with sqlite3.connect(DB_PATH) as conn:
-        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        row = conn.execute("SELECT COUNT(*) FROM users").fetchone()
+        return row[0] if row else 0
 
 
 def get_all_users() -> list[int]:
@@ -78,21 +57,37 @@ def get_all_users() -> list[int]:
         return [row[0] for row in cursor.fetchall()]
 
 
-def remove_user(user_id: int):
+def remove_users_bulk(user_ids: list[int]):
+    if not user_ids:
+        return
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        conn.executemany("DELETE FROM users WHERE user_id = ?", [(uid,) for uid in user_ids])
 
 
-# --- 3. СКАЧИВАНИЕ И НОРМАЛИЗАЦИЯ ЧЕРЕЗ FFMPEG ---
-def download_and_fix_video(url: str) -> dict | None:
+# --- 3. МОМЕНТАЛЬНЫЙ СПОСОБ ДЛЯ TIKTOK (1-2 СЕКУНДЫ) ---
+async def get_tiktok_fast(url: str) -> str | None:
+    api_url = "https://tikwm.com"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(api_url, data={"url": url}, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("code") == 0 and data.get("data"):
+                        return data["data"].get("play")
+    except Exception as e:
+        logging.error(f"Ошибка быстрого API TikTok: {e}")
+    return None
+
+
+# --- 4. БЫСТРЫЙ СПОСОБ ДЛЯ INSTAGRAM (СКЛЕЙКА БЕЗ ПЕРЕКОДИРОВКИ) ---
+def download_fast_ytdlp(url: str) -> dict | None:
     file_id = uuid.uuid4().hex
-    raw_path = os.path.join(DOWNLOAD_DIR, f"raw_{file_id}.mp4")
-    final_path = os.path.join(DOWNLOAD_DIR, f"ready_{file_id}.mp4")
+    output_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp4")
 
     ydl_opts = {
-        "outtmpl": raw_path,
+        "outtmpl": output_path,
         "ffmpeg_location": FFMPEG_PATH,
-        "format": "bv*+ba/b",
+        "format": "bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/b[vcodec^=avc1][ext=mp4]/b[ext=mp4]/b",
         "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
@@ -106,6 +101,9 @@ def download_and_fix_video(url: str) -> dict | None:
         },
     }
 
+    if os.path.exists(COOKIES_PATH):
+        ydl_opts["cookiefile"] = COOKIES_PATH
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -117,84 +115,18 @@ def download_and_fix_video(url: str) -> dict | None:
                         width, height = fmt["width"], fmt["height"]
                         break
 
-        if not os.path.exists(raw_path):
-            return None
-
-        cmd = [
-            FFMPEG_PATH,
-            "-y",
-            "-i", raw_path,
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "23",
-            "-pix_fmt", "yuv420p",
-            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            "-r", "30",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-movflags", "+faststart",
-            final_path
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-
-        if os.path.exists(final_path):
+        if os.path.exists(output_path):
             return {
-                "path": final_path,
+                "path": output_path,
                 "width": width,
                 "height": height,
             }
-
     except Exception as e:
-        logging.error(f"Ошибка при обработке видео {url}: {e}")
-    finally:
-        if os.path.exists(raw_path):
-            os.remove(raw_path)
+        logging.error(f"Ошибка yt-dlp при скачивании {url}: {e}")
+        if os.path.exists(output_path):
+            os.remove(output_path)
 
     return None
-
-
-# --- 4. ИМПОРТ БАЗЫ ОТПРАВКОЙ ФАЙЛА В TELEGRAM ---
-@dp.message(F.document)
-async def import_txt_db(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    doc = message.document
-    if not doc.file_name or not doc.file_name.endswith(".txt"):
-        await message.answer("⚠️ Отправьте файл с расширением `.txt`.", parse_mode="Markdown")
-        return
-
-    wait_msg = await message.answer("⏳ Загружаю базу в SQLite...")
-    temp_txt = os.path.join(DOWNLOAD_DIR, f"import_{uuid.uuid4().hex}.txt")
-
-    try:
-        file_info = await bot.get_file(doc.file_id)
-        await bot.download_file(file_info.file_path, destination=temp_txt)
-
-        with open(temp_txt, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-
-        found_ids = [int(match) for match in re.findall(r"\d{5,15}", content)]
-        if not found_ids:
-            await wait_msg.edit_text("❌ В файле не найдено числовых ID.")
-            return
-
-        added_count = add_users_bulk(found_ids)
-        total_count = get_users_count()
-
-        await wait_msg.edit_text(
-            f"✅ **Импорт завершён!**\n\n"
-            f"📄 Найдено ID: **{len(found_ids)}**\n"
-            f"➕ Добавлено новых: **{added_count}**\n"
-            f"📊 Всего в базе: **{total_count}**",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logging.error(f"Ошибка импорта: {e}")
-        await wait_msg.edit_text(f"❌ Ошибка при загрузке файла: {e}")
-    finally:
-        if os.path.exists(temp_txt):
-            os.remove(temp_txt)
 
 
 # --- 5. КОМАНДЫ АДМИНА ---
@@ -211,6 +143,8 @@ async def backup_cmd(message: types.Message):
         return
     if os.path.exists(DB_PATH):
         await message.answer_document(FSInputFile(DB_PATH), caption="💾 Резервная копия базы пользователей")
+    else:
+        await message.answer("❌ Файл базы данных пока не найден.")
 
 
 @dp.message(Command("stop_send"))
@@ -247,6 +181,7 @@ async def send_cmd(message: types.Message):
 
     is_sending = True
     success, removed = 0, 0
+    dead_batch = []
 
     for i, uid in enumerate(users, start=1):
         if not is_sending:
@@ -255,21 +190,26 @@ async def send_cmd(message: types.Message):
         try:
             await bot.send_message(chat_id=uid, text=text_to_send)
             success += 1
-            await asyncio.sleep(0.05)
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after)
             try:
                 await bot.send_message(chat_id=uid, text=text_to_send)
                 success += 1
             except Exception:
-                pass
-        except TelegramForbiddenError:
-            remove_user(uid)
+                dead_batch.append(uid)
+                removed += 1
+        except (TelegramForbiddenError, TelegramBadRequest):
+            dead_batch.append(uid)
             removed += 1
         except Exception:
             pass
+        finally:
+            await asyncio.sleep(0.05)
 
-        if i % 1000 == 0:
+        if i % 250 == 0:
+            if dead_batch:
+                remove_users_bulk(dead_batch)
+                dead_batch.clear()
             try:
                 await status_msg.edit_text(
                     f"⏳ **Идёт рассылка:** {i} из {total}\n"
@@ -281,11 +221,15 @@ async def send_cmd(message: types.Message):
             except TelegramBadRequest:
                 pass
 
+    if dead_batch:
+        remove_users_bulk(dead_batch)
+
     is_sending = False
-    await status_msg.edit_text(
+    # Отправляем финальный отчёт новым сообщением, чтобы он гарантированно пришёл даже спустя 1.5 часа
+    await message.answer(
         f"✅ **Рассылка завершена!**\n\n"
         f"📨 Доставлено живым: **{success}**\n"
-        f"🗑 Очищено заблокировавших: **{removed}**\n"
+        f"🗑 Очищено мёртвых/заблокировавших: **{removed}**\n"
         f"📊 Осталось живых в базе: **{get_users_count()}**",
         parse_mode="Markdown"
     )
@@ -297,3 +241,63 @@ async def start_cmd(message: types.Message):
     add_user(message.from_user.id)
     await message.answer(
         "📥 **Бот для скачивания видео из TikTok и Instagram**\n\n"
+        "Отправь ссылку на Reels или TikTok — пришлю моментально и без водяных знаков!",
+        parse_mode="Markdown"
+    )
+
+
+@dp.message(F.text)
+async def handle_link(message: types.Message):
+    add_user(message.from_user.id)
+    url = message.text.strip()
+    lower_url = url.lower()
+
+    if not any(domain in lower_url for domain in ["tiktok.com", "instagram.com"]):
+        await message.answer("⚠️ Отправь корректную ссылку на видео из **TikTok** или **Instagram**.", parse_mode="Markdown")
+        return
+
+    status_msg = await message.answer("⚡ Загружаю...")
+
+    if "tiktok.com" in lower_url:
+        direct_video_url = await get_tiktok_fast(url)
+        if direct_video_url:
+            try:
+                await message.answer_video(
+                    video=direct_video_url,
+                    supports_streaming=True,
+                    caption="✅ Скачано без водяных знаков!"
+                )
+                await status_msg.delete()
+                return
+            except Exception as e:
+                logging.warning(f"Прямая отправка TikTok не прошла, переключаюсь на yt-dlp: {e}")
+
+    video_data = await asyncio.to_thread(download_fast_ytdlp, url)
+
+    if not video_data:
+        await status_msg.edit_text("❌ Не удалось скачать видео. Проверь, что аккаунт открытый.")
+        return
+
+    file_path = video_data["path"]
+
+    try:
+        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        if file_size_mb > MAX_FILE_SIZE_MB:
+            await status_msg.edit_text("❌ Видео весит больше 50 МБ — лимит Telegram для ботов.")
+            return
+
+        video_file = FSInputFile(file_path)
+        await message.answer_video(
+            video=video_file,
+            width=video_data["width"],
+            height=video_data["height"],
+            supports_streaming=True,
+            caption="✅ Скачано без водяных знаков!"
+        )
+        await status_msg.delete()
+
+    except Exception as e:
+        logging.error(f"Ошибка отправки: {e}")
+        await status_msg.edit_text("❌ Ошибка при отправке видео в Telegram.")
+    finally:
+        if os.path.exists(file_path):
