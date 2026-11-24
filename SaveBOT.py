@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import logging
 import sqlite3
@@ -9,7 +10,7 @@ import imageio_ffmpeg
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import FSInputFile
-from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 
 # --- 1. НАСТРОЙКИ БОТА (берутся из переменных Bothost) ---
 TOKEN = os.getenv("BOT_TOKEN")
@@ -28,6 +29,7 @@ DOWNLOAD_DIR = os.path.join(BASE_DIR, "temp_videos")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+is_sending = False  # Флаг для управления большой рассылкой
 
 
 # --- 2. БАЗА ДАННЫХ ---
@@ -39,6 +41,15 @@ def init_db():
 def add_user(user_id: int):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+
+
+def add_users_bulk(user_ids: list[int]) -> int:
+    """Мгновенная массовая загрузка десятков тысяч ID за одну транзакцию."""
+    with sqlite3.connect(DB_PATH) as conn:
+        before = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        conn.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in user_ids])
+        after = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        return after - before
 
 
 def get_all_users() -> list[int]:
@@ -122,7 +133,53 @@ def download_and_fix_video(url: str) -> dict | None:
     return None
 
 
-# --- 4. КОМАНДЫ АДМИНА ---
+# --- 4. ИМПОРТ БАЗЫ ИЗ .TXT ФАЙЛА (ТОЛЬКО ДЛЯ АДМИНА) ---
+@dp.message(F.document)
+async def import_txt_db(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    doc = message.document
+    if not doc.file_name or not doc.file_name.endswith(".txt"):
+        await message.answer("⚠️ Отправьте текстовый файл с расширением `.txt` (например, `103664_users.txt`).", parse_mode="Markdown")
+        return
+
+    wait_msg = await message.answer("⏳ Скачиваю и загружаю базу в SQLite...")
+    temp_txt = os.path.join(DOWNLOAD_DIR, f"import_{uuid.uuid4().hex}.txt")
+
+    try:
+        file_info = await bot.get_file(doc.file_id)
+        await bot.download_file(file_info.file_path, destination=temp_txt)
+
+        with open(temp_txt, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+
+        # Находим все числовые Telegram ID (от 5 до 15 цифр) в тексте файла
+        found_ids = [int(match) for match in re.findall(r"\b\d{5,15}\b", content)]
+
+        if not found_ids:
+            await wait_msg.edit_text("❌ В файле не найдено ни одного числового ID.")
+            return
+
+        added_count = add_users_bulk(found_ids)
+        total_count = len(get_all_users())
+
+        await wait_msg.edit_text(
+            f"✅ **Импорт завершён!**\n\n"
+            f"📄 Найдено ID в файле: **{len(found_ids)}**\n"
+            f"➕ Добавлено новых в базу: **{added_count}**\n"
+            f"📊 Всего в базе теперь: **{total_count}**",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logging.error(f"Ошибка импорта базы: {e}")
+        await wait_msg.edit_text(f"❌ Ошибка при загрузке файла: {e}")
+    finally:
+        if os.path.exists(temp_txt):
+            os.remove(temp_txt)
+
+
+# --- 5. КОМАНДЫ АДМИНА (СТАТИСТИКА, РАССЫЛКА, БЭКАП) ---
 @dp.message(Command("stats"))
 async def stats_cmd(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -131,24 +188,57 @@ async def stats_cmd(message: types.Message):
     await message.answer(f"📊 Живых пользователей в базе: **{len(users)}**", parse_mode="Markdown")
 
 
-@dp.message(Command("send"))
-async def send_cmd(message: types.Message):
+@dp.message(Command("backup"))
+async def backup_cmd(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
+    if os.path.exists(DB_PATH):
+        await message.answer_document(FSInputFile(DB_PATH), caption="💾 Резервная копия базы пользователей")
+
+
+@dp.message(Command("stop_send"))
+async def stop_send_cmd(message: types.Message):
+    global is_sending
+    if message.from_user.id != ADMIN_ID:
+        return
+    is_sending = False
+    await message.answer("🛑 Останавливаю рассылку...")
+
+
+@dp.message(Command("send"))
+async def send_cmd(message: types.Message):
+    global is_sending
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    if is_sending:
+        await message.answer("⚠️ Рассылка уже идёт! Чтобы остановить её, напишите `/stop_send`.", parse_mode="Markdown")
+        return
+
     text_to_send = message.text.replace("/send", "", 1).strip()
     if not text_to_send:
-        await message.answer("❗ Напишите текст после команды.\nПример: `/send Привет!`", parse_mode="Markdown")
+        await message.answer("❗ Напишите текст после команды.\nПример: `/send Бот снова работает! Скачивай видео без водяных знаков!`", parse_mode="Markdown")
         return
 
     users = get_all_users()
-    status_msg = await message.answer(f"🚀 Запускаю рассылку по {len(users)} пользователям...")
+    total = len(users)
+    status_msg = await message.answer(
+        f"🚀 Запускаю рассылку по **{total}** пользователям...\n"
+        f"Чтобы остановить досрочно: `/stop_send`",
+        parse_mode="Markdown"
+    )
+
+    is_sending = True
     success, removed = 0, 0
 
-    for uid in users:
+    for i, uid in enumerate(users, start=1):
+        if not is_sending:
+            break
+
         try:
             await bot.send_message(chat_id=uid, text=text_to_send)
             success += 1
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.05)  # Безопасная скорость: ~20 сообщ./сек
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after)
             try:
@@ -162,13 +252,30 @@ async def send_cmd(message: types.Message):
         except Exception:
             pass
 
+        # Каждые 1000 человек обновляем прогресс, чтобы вы видели, как идёт процесс
+        if i % 1000 == 0:
+            try:
+                await status_msg.edit_text(
+                    f"⏳ **Идёт рассылка:** {i} из {total}\n"
+                    f"📨 Доставлено живым: **{success}**\n"
+                    f"🗑 Очищено мёртвых: **{removed}**\n\n"
+                    f"Остановить: `/stop_send`",
+                    parse_mode="Markdown"
+                )
+            except TelegramBadRequest:
+                pass
+
+    is_sending = False
     await status_msg.edit_text(
-        f"✅ **Рассылка завершена!**\n📨 Доставлено: **{success}**\n🗑 Очищено: **{removed}**",
+        f"✅ **Рассылка завершена!**\n\n"
+        f"📨 Доставлено живым: **{success}**\n"
+        f"🗑 Очищено заблокировавших: **{removed}**\n"
+        f"📊 Осталось живых в базе: **{len(get_all_users())}**",
         parse_mode="Markdown"
     )
 
 
-# --- 5. ОБРАБОТКА ССЫЛОК ---
+# --- 6. ОБРАБОТКА ССЫЛОК ---
 @dp.message(CommandStart())
 async def start_cmd(message: types.Message):
     add_user(message.from_user.id)
@@ -188,49 +295,4 @@ async def handle_link(message: types.Message):
         await message.answer("⚠️ Отправь корректную ссылку на видео из **TikTok** или **Instagram**.", parse_mode="Markdown")
         return
 
-    status_msg = await message.answer("⏳ Скачиваю и оптимизирую видео...")
-    video_data = await asyncio.to_thread(download_and_fix_video, url)
 
-    if not video_data:
-        await status_msg.edit_text("❌ Не удалось скачать видео. Проверь, что аккаунт открытый.")
-        return
-
-    file_path = video_data["path"]
-
-    try:
-        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-        if file_size_mb > MAX_FILE_SIZE_MB:
-            await status_msg.edit_text("❌ Видео весит больше 50 МБ — лимит Telegram для ботов.")
-            return
-
-        await status_msg.edit_text("📤 Отправляю видео...")
-        video_file = FSInputFile(file_path)
-        await message.answer_video(
-            video=video_file,
-            width=video_data["width"],
-            height=video_data["height"],
-            supports_streaming=True,
-            caption="✅ Скачано без водяных знаков!"
-        )
-        await status_msg.delete()
-
-    except Exception as e:
-        logging.error(f"Ошибка отправки: {e}")
-        await status_msg.edit_text("❌ Ошибка при отправке видео в Telegram.")
-    finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-
-
-# --- 6. ЗАПУСК ---
-async def main():
-    init_db()
-    await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("Бот-загрузчик запущен на сервере!")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logging.info("Бот остановлен.")
