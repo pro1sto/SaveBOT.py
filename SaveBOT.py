@@ -32,10 +32,24 @@ FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 is_sending = False
 
 
-# --- 2. БАЗА ДАННЫХ ---
+# --- 2. БАЗА ДАННЫХ (С АВТОИМПОРТОМ ИЗ ПАПКИ) ---
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
+        # Включаем WAL-режим, чтобы база работала быстро и не блокировалась при большой нагрузке
+        conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)")
+
+        # Способ 1: Если вы загрузили файл 103664_users.txt в папку бота на Bothost,
+        # при запуске он автоматически зальёт всех юзеров в базу и удалит текстовый файл
+        txt_path = os.path.join(BASE_DIR, "103664_users.txt")
+        if os.path.exists(txt_path):
+            logging.info("Найден файл 103664_users.txt — начинаю автоимпорт...")
+            with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
+                ids = [(int(m),) for m in re.findall(r"\b\d{5,15}\b", f.read())]
+            if ids:
+                conn.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", ids)
+                logging.info(f"Успешно импортировано записей: {len(ids)}")
+            os.remove(txt_path)
 
 
 def add_user(user_id: int):
@@ -137,7 +151,7 @@ def download_and_fix_video(url: str) -> dict | None:
     return None
 
 
-# --- 4. ИМПОРТ БАЗЫ ИЗ .TXT ФАЙЛА (ТОЛЬКО ДЛЯ АДМИНА) ---
+# --- 4. СПОСОБ 2: ИМПОРТ БАЗЫ ОТПРАВКОЙ ФАЙЛА В TELEGRAM ---
 @dp.message(F.document)
 async def import_txt_db(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -145,10 +159,10 @@ async def import_txt_db(message: types.Message):
 
     doc = message.document
     if not doc.file_name or not doc.file_name.endswith(".txt"):
-        await message.answer("⚠️ Отправьте текстовый файл с расширением `.txt`.", parse_mode="Markdown")
+        await message.answer("⚠️ Отправьте файл с расширением `.txt`.", parse_mode="Markdown")
         return
 
-    wait_msg = await message.answer("⏳ Скачиваю и загружаю базу в SQLite...")
+    wait_msg = await message.answer("⏳ Загружаю базу в SQLite...")
     temp_txt = os.path.join(DOWNLOAD_DIR, f"import_{uuid.uuid4().hex}.txt")
 
     try:
@@ -159,9 +173,8 @@ async def import_txt_db(message: types.Message):
             content = f.read()
 
         found_ids = [int(match) for match in re.findall(r"\b\d{5,15}\b", content)]
-
         if not found_ids:
-            await wait_msg.edit_text("❌ В файле не найдено ни одного числового ID.")
+            await wait_msg.edit_text("❌ В файле не найдено числовых ID.")
             return
 
         added_count = add_users_bulk(found_ids)
@@ -169,20 +182,20 @@ async def import_txt_db(message: types.Message):
 
         await wait_msg.edit_text(
             f"✅ **Импорт завершён!**\n\n"
-            f"📄 Найдено ID в файле: **{len(found_ids)}**\n"
-            f"➕ Добавлено новых в базу: **{added_count}**\n"
-            f"📊 Всего в базе теперь: **{total_count}**",
+            f"📄 Найдено ID: **{len(found_ids)}**\n"
+            f"➕ Добавлено новых: **{added_count}**\n"
+            f"📊 Всего в базе: **{total_count}**",
             parse_mode="Markdown"
         )
     except Exception as e:
-        logging.error(f"Ошибка импорта базы: {e}")
+        logging.error(f"Ошибка импорта: {e}")
         await wait_msg.edit_text(f"❌ Ошибка при загрузке файла: {e}")
     finally:
         if os.path.exists(temp_txt):
             os.remove(temp_txt)
 
 
-# --- 5. КОМАНДЫ АДМИНА (СТАТИСТИКА, РАССЫЛКА, БЭКАП) ---
+# --- 5. КОМАНДЫ АДМИНА ---
 @dp.message(Command("stats"))
 async def stats_cmd(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -214,7 +227,7 @@ async def send_cmd(message: types.Message):
         return
 
     if is_sending:
-        await message.answer("⚠️ Рассылка уже идёт! Чтобы остановить её, напишите `/stop_send`.", parse_mode="Markdown")
+        await message.answer("⚠️ Рассылка уже идёт! Остановить: `/stop_send`", parse_mode="Markdown")
         return
 
     text_to_send = message.text.replace("/send", "", 1).strip()
@@ -226,7 +239,7 @@ async def send_cmd(message: types.Message):
     total = len(users)
     status_msg = await message.answer(
         f"🚀 Запускаю рассылку по **{total}** пользователям...\n"
-        f"Чтобы остановить досрочно: `/stop_send`",
+        f"Остановить досрочно: `/stop_send`",
         parse_mode="Markdown"
     )
 
@@ -282,28 +295,5 @@ async def start_cmd(message: types.Message):
     add_user(message.from_user.id)
     await message.answer(
         "📥 **Бот для скачивания видео из TikTok и Instagram**\n\n"
-        "Отправь ссылку на Reels или TikTok — пришлю в плавном качестве без водяных знаков!",
-        parse_mode="Markdown"
-    )
 
-
-@dp.message(F.text)
-async def handle_link(message: types.Message):
-    add_user(message.from_user.id)
-    url = message.text.strip()
-
-    if not any(domain in url.lower() for domain in ["tiktok.com", "instagram.com"]):
-        await message.answer("⚠️ Отправь корректную ссылку на видео из **TikTok** или **Instagram**.", parse_mode="Markdown")
-        return
-
-    status_msg = await message.answer("⏳ Скачиваю и оптимизирую видео...")
-    video_data = await asyncio.to_thread(download_and_fix_video, url)
-
-    if not video_data:
-        await status_msg.edit_text("❌ Не удалось скачать видео. Проверь, что аккаунт открытый.")
-        return
-
-    file_path = video_data["path"]
-
-    try:
 
