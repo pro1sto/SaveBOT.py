@@ -1,21 +1,19 @@
 import os
+import json
+import urllib.request
+import urllib.parse
 import asyncio
 import logging
 import sqlite3
-import uuid
-import aiohttp
-import yt_dlp
-import imageio_ffmpeg
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import FSInputFile
+from aiogram.types import InputMediaPhoto
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 
-# --- 1. НАСТРОЙКИ БОТА (ТОКЕН СКРЫТ В ПЕРЕМЕННЫХ СЕРВЕРА) ---
+# --- 1. НАСТРОЙКИ БОТА ---
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = 994444870
-MAX_FILE_SIZE_MB = 49
-# -----------------------------------------------------------
+# -------------------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -24,11 +22,6 @@ dp = Dispatcher()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "downloader_users.db")
-DOWNLOAD_DIR = os.path.join(BASE_DIR, "temp_videos")
-COOKIES_PATH = os.path.join(BASE_DIR, "cookies.txt")
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 is_sending = False
 
 
@@ -63,75 +56,35 @@ def remove_users_bulk(user_ids: list[int]):
         conn.executemany("DELETE FROM users WHERE user_id = ?", [(uid,) for uid in user_ids])
 
 
-# --- 3. БЫСТРЫЙ TIKTOK (1-2 СЕКУНДЫ) ---
-async def get_tiktok_fast(url: str) -> str | None:
+# --- 3. ПОЛУЧЕНИЕ МЕДИА ИЗ TIKTOK БЕЗ ВОДЯНЫХ ЗНАКОВ ---
+def get_tiktok_media_sync(url: str) -> dict | None:
     api_url = "https://tikwm.com"
+    post_data = urllib.parse.urlencode({"url": url}).encode("utf-8")
+    req = urllib.request.Request(
+        api_url,
+        data=post_data,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    )
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(api_url, data={"url": url}, timeout=10) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("code") == 0 and data.get("data"):
-                        play_url = data["data"].get("play")
-                        if play_url and play_url.startswith("/"):
-                            return "https://tikwm.com" + play_url
-                        return play_url
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            if result.get("code") == 0 and result.get("data"):
+                data = result["data"]
+                # Если пост состоит из фотографий (слайд-шоу)
+                if data.get("images"):
+                    return {"type": "images", "urls": data["images"]}
+                # Если это обычный видеоролик
+                play_url = data.get("play")
+                if play_url:
+                    if play_url.startswith("/"):
+                        play_url = "https://tikwm.com" + play_url
+                    return {"type": "video", "url": play_url}
     except Exception as e:
-        logging.error(f"Ошибка быстрого API TikTok: {e}")
+        logging.error(f"Ошибка при получении данных TikTok: {e}")
     return None
 
 
-# --- 4. УНИВЕРСАЛЬНОЕ СКАЧИВАНИЕ (ДЛЯ INSTAGRAM И СЛОЖНЫХ ССЫЛОК) ---
-def download_fast_ytdlp(url: str) -> dict | None:
-    file_id = uuid.uuid4().hex
-    output_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp4")
-
-    ydl_opts = {
-        "outtmpl": output_path,
-        "ffmpeg_location": FFMPEG_PATH,
-        "format": "bv*+ba/b",
-        "merge_output_format": "mp4",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )
-        },
-    }
-
-    if os.path.exists(COOKIES_PATH):
-        ydl_opts["cookiefile"] = COOKIES_PATH
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            width = info.get("width")
-            height = info.get("height")
-            if not width or not height:
-                for fmt in info.get("requested_formats", []):
-                    if fmt.get("width") and fmt.get("height"):
-                        width, height = fmt["width"], fmt["height"]
-                        break
-
-        if os.path.exists(output_path):
-            return {
-                "path": output_path,
-                "width": width,
-                "height": height,
-            }
-    except Exception as e:
-        logging.error(f"Ошибка yt-dlp при скачивании {url}: {e}")
-        if os.path.exists(output_path):
-            os.remove(output_path)
-
-    return None
-
-
-# --- 5. КОМАНДЫ АДМИНА ---
+# --- 4. КОМАНДЫ АДМИНА ---
 @dp.message(Command("stats"))
 async def stats_cmd(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -226,13 +179,13 @@ async def send_cmd(message: types.Message):
     )
 
 
-# --- 6. ОБРАБОТКА ССЫЛОК ---
+# --- 5. ОБРАБОТКА ССЫЛОК TIKTOK ---
 @dp.message(CommandStart())
 async def start_cmd(message: types.Message):
     add_user(message.from_user.id)
     await message.answer(
-        "📥 **Бот для скачивания видео из TikTok и Instagram**\n\n"
-        "Отправь ссылку на Reels или TikTok — пришлю моментально и без водяных знаков!",
+        "📥 **Бот для скачивания видео из TikTok**\n\n"
+        "Отправь ссылку на любой ролик или фото-пост из TikTok — пришлю моментально и без водяных знаков!",
         parse_mode="Markdown"
     )
 
@@ -241,72 +194,49 @@ async def start_cmd(message: types.Message):
 async def handle_link(message: types.Message):
     add_user(message.from_user.id)
     url = message.text.strip()
-    lower_url = url.lower()
 
-    if not any(domain in lower_url for domain in ["tiktok.com", "instagram.com"]):
-        await message.answer("⚠️ Отправь корректную ссылку на видео из **TikTok** или **Instagram**.", parse_mode="Markdown")
+    if "tiktok.com" not in url.lower():
+        await message.answer("⚠️ Пожалуйста, отправь корректную ссылку на **TikTok**.", parse_mode="Markdown")
         return
 
     status_msg = await message.answer("⚡ Загружаю...")
+    tt_data = await asyncio.to_thread(get_tiktok_media_sync, url)
 
-    if "tiktok.com" in lower_url:
-        direct_video_url = await get_tiktok_fast(url)
-        if direct_video_url:
-            try:
-                await message.answer_video(
-                    video=direct_video_url,
-                    supports_streaming=True,
-                    caption="✅ Скачано без водяных знаков!"
-                )
-                await status_msg.delete()
-                return
-            except Exception as e:
-                logging.warning(f"Прямая отправка TikTok не прошла, качаю через yt-dlp: {e}")
-
-    video_data = await asyncio.to_thread(download_fast_ytdlp, url)
-
-    if not video_data:
-        await status_msg.edit_text("❌ Не удалось скачать видео. Проверь, что аккаунт открытый.")
+    if not tt_data:
+        await status_msg.edit_text("❌ Не удалось скачать медиа. Проверь, что ролик не удалён и аккаунт открытый.")
         return
 
-    file_path = video_data["path"]
-
     try:
-        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-        if file_size_mb > MAX_FILE_SIZE_MB:
-            await status_msg.edit_text("❌ Видео весит больше 50 МБ — лимит Telegram для ботов.")
-            return
-
-        video_file = FSInputFile(file_path)
-        await message.answer_video(
-            video=video_file,
-            width=video_data["width"],
-            height=video_data["height"],
-            supports_streaming=True,
-            caption="✅ Скачано без водяных знаков!"
-        )
-        await status_msg.delete()
-
+        if tt_data["type"] == "images":
+            photos = tt_data["urls"]
+            for idx in range(0, len(photos), 10):
+                media_group = [InputMediaPhoto(media=p_url) for p_url in photos[idx:idx + 10]]
+                await message.answer_media_group(media=media_group)
+            await status_msg.delete()
+        elif tt_data["type"] == "video":
+            await message.answer_video(
+                video=tt_data["url"],
+                supports_streaming=True,
+                caption="✅ Скачано без водяных знаков!"
+            )
+            await status_msg.delete()
     except Exception as e:
-        logging.error(f"Ошибка отправки: {e}")
-        await status_msg.edit_text("❌ Ошибка при отправке видео в Telegram.")
-    finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        logging.error(f"Ошибка при отправке медиа: {e}")
+        await status_msg.edit_text("❌ Ошибка при отправке файла в Telegram.")
 
 
-# --- 7. ЗАПУСК ---
+# --- 6. ЗАПУСК ---
 async def main():
     init_db()
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("Турбо-загрузчик запущен!")
+    logging.info("TikTok-загрузчик успешно запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-
+        logging.info("Бот остановлен.")
 
 
 
