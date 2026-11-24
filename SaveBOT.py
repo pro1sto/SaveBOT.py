@@ -11,11 +11,11 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import FSInputFile
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 
-# --- 1. НАСТРОЙКИ БОТА ---
+# --- 1. НАСТРОЙКИ БОТА (ТОКЕН СКРЫТ В ПЕРЕМЕННЫХ СЕРВЕРА) ---
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = 994444870
 MAX_FILE_SIZE_MB = 49
-# -------------------------
+# -----------------------------------------------------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -63,7 +63,7 @@ def remove_users_bulk(user_ids: list[int]):
         conn.executemany("DELETE FROM users WHERE user_id = ?", [(uid,) for uid in user_ids])
 
 
-# --- 3. БЫСТРЫЙ TIKTOK ---
+# --- 3. БЫСТРЫЙ TIKTOK (1-2 СЕКУНДЫ) ---
 async def get_tiktok_fast(url: str) -> str | None:
     api_url = "https://tikwm.com"
     try:
@@ -81,7 +81,7 @@ async def get_tiktok_fast(url: str) -> str | None:
     return None
 
 
-# --- 4. УНИВЕРСАЛЬНОЕ СКАЧИВАНИЕ (ДЛЯ ВСЕХ ССЫЛОК) ---
+# --- 4. УНИВЕРСАЛЬНОЕ СКАЧИВАНИЕ (ДЛЯ INSTAGRAM И СЛОЖНЫХ ССЫЛОК) ---
 def download_fast_ytdlp(url: str) -> dict | None:
     file_id = uuid.uuid4().hex
     output_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp4")
@@ -89,7 +89,6 @@ def download_fast_ytdlp(url: str) -> dict | None:
     ydl_opts = {
         "outtmpl": output_path,
         "ffmpeg_location": FFMPEG_PATH,
-        # Универсальный формат: берём любой лучший поток без жёсткого ограничения по кодеку
         "format": "bv*+ba/b",
         "merge_output_format": "mp4",
         "noplaylist": True,
@@ -250,7 +249,6 @@ async def handle_link(message: types.Message):
 
     status_msg = await message.answer("⚡ Загружаю...")
 
-    # 1. Пробуем быстрое API для TikTok
     if "tiktok.com" in lower_url:
         direct_video_url = await get_tiktok_fast(url)
         if direct_video_url:
@@ -265,7 +263,6 @@ async def handle_link(message: types.Message):
             except Exception as e:
                 logging.warning(f"Прямая отправка TikTok не прошла, качаю через yt-dlp: {e}")
 
-    # 2. Запасной/основной метод через yt-dlp без тяжёлой перекодировки
     video_data = await asyncio.to_thread(download_fast_ytdlp, url)
 
     if not video_data:
@@ -306,5 +303,10 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+
+
 
 
