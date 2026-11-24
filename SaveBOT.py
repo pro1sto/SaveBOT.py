@@ -12,12 +12,11 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import FSInputFile
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 
-# --- 1. НАСТРОЙКИ БОТА (берутся из переменных Bothost) ---
+# --- 1. НАСТРОЙКИ БОТА ---
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = 994444870
-
 MAX_FILE_SIZE_MB = 49
-# -------------------------------------------------------
+# -------------------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -30,7 +29,7 @@ DOWNLOAD_DIR = os.path.join(BASE_DIR, "temp_videos")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
-is_sending = False  # Флаг для управления большой рассылкой
+is_sending = False
 
 
 # --- 2. БАЗА ДАННЫХ ---
@@ -45,12 +44,16 @@ def add_user(user_id: int):
 
 
 def add_users_bulk(user_ids: list[int]) -> int:
-    """Мгновенная массовая загрузка десятков тысяч ID за одну транзакцию."""
     with sqlite3.connect(DB_PATH) as conn:
         before = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         conn.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in user_ids])
         after = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         return after - before
+
+
+def get_users_count() -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
 
 def get_all_users() -> list[int]:
@@ -142,7 +145,7 @@ async def import_txt_db(message: types.Message):
 
     doc = message.document
     if not doc.file_name or not doc.file_name.endswith(".txt"):
-        await message.answer("⚠️ Отправьте текстовый файл с расширением `.txt` (например, `103664_users.txt`).", parse_mode="Markdown")
+        await message.answer("⚠️ Отправьте текстовый файл с расширением `.txt`.", parse_mode="Markdown")
         return
 
     wait_msg = await message.answer("⏳ Скачиваю и загружаю базу в SQLite...")
@@ -155,7 +158,6 @@ async def import_txt_db(message: types.Message):
         with open(temp_txt, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
 
-        # Находим все числовые Telegram ID (от 5 до 15 цифр) в тексте файла
         found_ids = [int(match) for match in re.findall(r"\b\d{5,15}\b", content)]
 
         if not found_ids:
@@ -163,7 +165,7 @@ async def import_txt_db(message: types.Message):
             return
 
         added_count = add_users_bulk(found_ids)
-        total_count = len(get_all_users())
+        total_count = get_users_count()
 
         await wait_msg.edit_text(
             f"✅ **Импорт завершён!**\n\n"
@@ -185,8 +187,7 @@ async def import_txt_db(message: types.Message):
 async def stats_cmd(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
-    users = get_all_users()
-    await message.answer(f"📊 Живых пользователей в базе: **{len(users)}**", parse_mode="Markdown")
+    await message.answer(f"📊 Живых пользователей в базе: **{get_users_count()}**", parse_mode="Markdown")
 
 
 @dp.message(Command("backup"))
@@ -218,7 +219,7 @@ async def send_cmd(message: types.Message):
 
     text_to_send = message.text.replace("/send", "", 1).strip()
     if not text_to_send:
-        await message.answer("❗ Напишите текст после команды.\nПример: `/send Бот снова работает! Скачивай видео без водяных знаков!`", parse_mode="Markdown")
+        await message.answer("❗ Напишите текст после команды.\nПример: `/send Бот снова работает!`", parse_mode="Markdown")
         return
 
     users = get_all_users()
@@ -239,7 +240,7 @@ async def send_cmd(message: types.Message):
         try:
             await bot.send_message(chat_id=uid, text=text_to_send)
             success += 1
-            await asyncio.sleep(0.05)  # Безопасная скорость: ~20 сообщ./сек
+            await asyncio.sleep(0.05)
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after)
             try:
@@ -253,7 +254,6 @@ async def send_cmd(message: types.Message):
         except Exception:
             pass
 
-        # Каждые 1000 человек обновляем прогресс, чтобы вы видели, как идёт процесс
         if i % 1000 == 0:
             try:
                 await status_msg.edit_text(
@@ -271,7 +271,7 @@ async def send_cmd(message: types.Message):
         f"✅ **Рассылка завершена!**\n\n"
         f"📨 Доставлено живым: **{success}**\n"
         f"🗑 Очищено заблокировавших: **{removed}**\n"
-        f"📊 Осталось живых в базе: **{len(get_all_users())}**",
+        f"📊 Осталось живых в базе: **{get_users_count()}**",
         parse_mode="Markdown"
     )
 
@@ -296,4 +296,13 @@ async def handle_link(message: types.Message):
         await message.answer("⚠️ Отправь корректную ссылку на видео из **TikTok** или **Instagram**.", parse_mode="Markdown")
         return
 
+    status_msg = await message.answer("⏳ Скачиваю и оптимизирую видео...")
+    video_data = await asyncio.to_thread(download_and_fix_video, url)
 
+    if not video_data:
+        await status_msg.edit_text("❌ Не удалось скачать видео. Проверь, что аккаунт открытый.")
+        return
+
+    file_path = video_data["path"]
+
+    try:
