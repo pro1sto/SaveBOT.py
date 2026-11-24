@@ -11,11 +11,11 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import FSInputFile
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError
 
-# --- 1. НАСТРОЙКИ БОТА ---
-TOKEN = "6570301210:AAFyu3vlgCrzKPW92l-NB75UkPccsxpFkhI"
-ADMIN_ID = 994444870
+# --- 1. НАСТРОЙКИ БОТА (берутся из переменных Bothost) ---
+TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 MAX_FILE_SIZE_MB = 49
-# -------------------------
+# -------------------------------------------------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -52,7 +52,7 @@ def remove_user(user_id: int):
         conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
 
 
-# --- 3. СКАЧИВАНИЕ И ЖЁСТКАЯ НОРМАЛИЗАЦИЯ ЧЕРЕЗ FFMPEG ---
+# --- 3. СКАЧИВАНИЕ И НОРМАЛИЗАЦИЯ ЧЕРЕЗ FFMPEG ---
 def download_and_fix_video(url: str) -> dict | None:
     file_id = uuid.uuid4().hex
     raw_path = os.path.join(DOWNLOAD_DIR, f"raw_{file_id}.mp4")
@@ -61,7 +61,6 @@ def download_and_fix_video(url: str) -> dict | None:
     ydl_opts = {
         "outtmpl": raw_path,
         "ffmpeg_location": FFMPEG_PATH,
-        # Скачиваем лучший доступный поток (видео + звук)
         "format": "bv*+ba/b",
         "merge_output_format": "mp4",
         "noplaylist": True,
@@ -77,7 +76,6 @@ def download_and_fix_video(url: str) -> dict | None:
     }
 
     try:
-        # Этап 1: Скачиваем исходник
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             width = info.get("width")
@@ -91,10 +89,6 @@ def download_and_fix_video(url: str) -> dict | None:
         if not os.path.exists(raw_path):
             return None
 
-        # Этап 2: Принудительно прогоняем через ffmpeg:
-        # -c:v libx264 -pix_fmt yuv420p -> убирает чёрный экран в Instagram
-        # -r 30 -vsync cfr -> фиксирует 30 FPS и убирает дёрганье/тормоза в TikTok
-        # -vf scale=trunc(iw/2)*2:trunc(ih/2)*2 -> делает размеры чётными (обязательно для H.264)
         cmd = [
             FFMPEG_PATH,
             "-y",
@@ -122,7 +116,6 @@ def download_and_fix_video(url: str) -> dict | None:
     except Exception as e:
         logging.error(f"Ошибка при обработке видео {url}: {e}")
     finally:
-        # Всегда удаляем сырой промежуточный файл
         if os.path.exists(raw_path):
             os.remove(raw_path)
 
@@ -233,7 +226,7 @@ async def handle_link(message: types.Message):
 async def main():
     init_db()
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("Бот-загрузчик с принудительной нормализацией запущен!")
+    logging.info("Бот-загрузчик запущен на сервере!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
