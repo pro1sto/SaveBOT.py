@@ -14,7 +14,8 @@ from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, Teleg
 
 # --- 1. НАСТРОЙКИ БОТА (берутся из переменных Bothost) ---
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+ADMIN_ID = 994444870
+
 MAX_FILE_SIZE_MB = 49
 # -------------------------------------------------------
 
