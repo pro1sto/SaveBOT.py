@@ -30,12 +30,22 @@ from aiogram.exceptions import (
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = 994444870
 
+# 1. КАНАЛЫ (идут первыми, подписка на них ПРОВЕРЯЕТСЯ)
 REQUIRED_CHANNELS = [
     {
         "id": -1006003972835,
         "url": "https://t.me/+afPTm145m0JhNjcy",
         "name": "ПОДПИСАТЬСЯ",
     },
+]
+
+# 2. БОТЫ-СПОНСОРЫ (идут после каналов, БЕЗ проверки)
+SPONSOR_BOTS = [
+    {
+        "url": "https://t.me/InstTikTokSaveBot",
+        "name": "🤖 Нажать START",
+    },
+    # Можно добавить ещё ботов или оставить список пустым: SPONSOR_BOTS = []
 ]
 
 if not TOKEN:
@@ -81,13 +91,13 @@ def get_users_count():
     with sqlite3.connect(DB_PATH) as conn:
         return conn.execute(
             "SELECT COUNT(*) FROM users"
-        ).fetchone()
+        ).fetchone()[0]
 
 
 def get_all_users():
     with sqlite3.connect(DB_PATH) as conn:
         return [
-            row
+            row[0]
             for row in conn.execute("SELECT user_id FROM users")
         ]
 
@@ -104,13 +114,14 @@ def remove_users_bulk(user_ids):
 
 
 # ==============================
-# ПРОВЕРКА ОБЯЗАТЕЛЬНОЙ ПОДПИСКИ
+# ПРОВЕРКА ПОДПИСКИ И КЛАВИАТУРА
 # ==============================
 
 async def check_subscription(user_id: int) -> bool:
     if user_id == ADMIN_ID:
         return True
 
+    # Проверяем только каналы
     for channel in REQUIRED_CHANNELS:
         try:
             member = await bot.get_chat_member(
@@ -127,10 +138,21 @@ async def check_subscription(user_id: int) -> bool:
 
 
 def get_sub_keyboard() -> InlineKeyboardMarkup:
-    buttons = [
-        [InlineKeyboardButton(text=f"📢 {ch['name']}", url=ch["url"])]
-        for ch in REQUIRED_CHANNELS
-    ]
+    buttons = []
+
+    # Сначала добавляем все каналы
+    for ch in REQUIRED_CHANNELS:
+        buttons.append(
+            [InlineKeyboardButton(text=f"📢 {ch['name']}", url=ch["url"])]
+        )
+
+    # Затем добавляем всех ботов (без проверки)
+    for b in SPONSOR_BOTS:
+        buttons.append(
+            [InlineKeyboardButton(text=b["name"], url=b["url"])]
+        )
+
+    # В самом низу кнопка проверки
     buttons.append(
         [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")]
     )
@@ -142,7 +164,7 @@ def get_sub_keyboard() -> InlineKeyboardMarkup:
 # ==============================
 
 def get_tiktok_media_sync(url: str):
-    api_url = "https://www.tikwm.com/api/"
+    api_url = "https://tikwm.com"
 
     post_data = urllib.parse.urlencode({
         "url": url,
@@ -154,7 +176,7 @@ def get_tiktok_media_sync(url: str):
         data=post_data,
         headers={
             "User-Agent": "Mozilla/5.0",
-            "Referer": "https://www.tikwm.com/",
+            "Referer": "https://tikwm.com",
             "Content-Type": "application/x-www-form-urlencoded"
         },
         method="POST"
@@ -184,7 +206,7 @@ def get_tiktok_media_sync(url: str):
 
         if play_url:
             play_url = urllib.parse.urljoin(
-                "https://www.tikwm.com/",
+                "https://tikwm.com",
                 play_url
             )
 
@@ -211,7 +233,7 @@ def download_video_sync(url: str):
             url,
             headers={
                 "User-Agent": "Mozilla/5.0",
-                "Referer": "https://www.tiktok.com/"
+                "Referer": "https://tiktok.com"
             }
         )
 
@@ -248,20 +270,12 @@ def download_video_sync(url: str):
         return None
 
 # ==============================
-# 5. КОМАНДА /START И ПРОВЕРКА КНОПКИ
+# 5. КОМАНДА /START (БЕЗ ПРОВЕРКИ) И КНОПКА ПРОВЕРКИ
 # ==============================
 
 @dp.message(CommandStart())
 async def start_cmd(message: types.Message):
     add_user(message.from_user.id)
-
-    if not await check_subscription(message.from_user.id):
-        await message.answer(
-            "👋 <b>Для использования бота подпишитесь на канал:</b>",
-            reply_markup=get_sub_keyboard(),
-            parse_mode="HTML"
-        )
-        return
 
     await message.answer(
         "📥 <b>Бот для скачивания видео из TikTok</b>\n\n"
@@ -276,12 +290,12 @@ async def check_sub_callback(callback: CallbackQuery):
     if await check_subscription(callback.from_user.id):
         await callback.message.edit_text(
             "✅ <b>Спасибо за подписку!</b>\n\n"
-            "Теперь отправь ссылку на видео или фото-пост TikTok.",
+            "Теперь отправь ссылку на видео или фото-пост TikTok ещё раз.",
             parse_mode="HTML"
         )
     else:
         await callback.answer(
-            "❌ Вы ещё не подписались на канал!",
+            "❌ Вы ещё не подписались на каналы!",
             show_alert=True
         )
 
@@ -421,7 +435,7 @@ async def send_cmd(message: types.Message):
 
 
 # ==============================
-# 9. ОБРАБОТКА ССЫЛОК TIKTOK
+# 9. ОБРАБОТКА ССЫЛОК TIKTOK (С ПРОВЕРКОЙ ПОДПИСКИ)
 # ==============================
 
 @dp.message(F.text.contains("tiktok.com"))
@@ -430,7 +444,7 @@ async def tiktok_handler(message: types.Message):
 
     if not await check_subscription(message.from_user.id):
         await message.answer(
-            "🔒 <b>Для скачивания подпишитесь на канал:</b>",
+            "🔒 <b>Для скачивания подпишитесь на спонсоров:</b>",
             reply_markup=get_sub_keyboard(),
             parse_mode="HTML"
         )
