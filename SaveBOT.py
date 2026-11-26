@@ -107,27 +107,85 @@ def get_sub_keyboard() -> InlineKeyboardMarkup:
     btns.append([InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")])
     return InlineKeyboardMarkup(inline_keyboard=btns)
 
-# 4. TIKTOK API И ЗАГРУЗКА
+# 4. TIKTOK API + РЕЗЕРВНЫЙ YT-DLP
+def resolve_url(url: str) -> str:
+    """Разворачивает короткие ссылки ://tiktok.com / ://tiktok.com в полные."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.geturl()
+    except Exception:
+        return url
+
 def get_tiktok_media_sync(url: str):
-    post_data = urllib.parse.urlencode({"url": url, "hd": 1}).encode("utf-8")
+    full_url = resolve_url(url)
+    post_data = urllib.parse.urlencode({"url": full_url, "hd": 1}).encode("utf-8")
     req = urllib.request.Request(
         "https://tikwm.com",
         data=post_data,
-        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://tikwm.com", "Content-Type": "application/x-www-form-urlencoded"},
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Origin": "https://tikwm.com",
+            "Referer": "https://tikwm.com/",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        },
         method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             res = json.loads(resp.read().decode("utf-8"))
         if res.get("code") != 0:
+            logging.error(f"TikWM вернул ошибку: {res}")
             return None
         data = res.get("data") or {}
         if data.get("images"):
             return {"type": "images", "urls": data["images"]}
         if data.get("play"):
-            return {"type": "video", "url": urllib.parse.urljoin("https://tikwm.com", data["play"])}
+            return {"type": "video", "url": urllib.parse.urljoin("https://tikwm.com/", data["play"])}
         return None
-    except Exception:
+    except Exception as e:
+        logging.error(f"Сбой запроса к TikWM: {e}")
+        return None
+
+def download_video_sync(url: str):
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://tiktok.com"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            temp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+            with temp:
+                shutil.copyfileobj(resp, temp)
+            if os.path.getsize(temp.name) == 0:
+                os.remove(temp.name)
+                return None
+            return temp.name
+    except Exception as e:
+        logging.error(f"Ошибка загрузки файла: {e}")
+        return None
+
+def download_with_ytdlp_sync(url: str):
+    """Резервное скачивание через yt-dlp, если tikwm не сработал."""
+    try:
+        import yt_dlp
+        temp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        temp_path = temp.name
+        temp.close()
+        os.remove(temp_path)
+
+        ydl_opts = {
+            "outtmpl": temp_path,
+            "format": "best[ext=mp4]/best",
+            "quiet": True,
+            "no_warnings": True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+            return temp_path
+        return None
+    except Exception as e:
+        logging.error(f"Ошибка резервного yt-dlp: {e}")
         return None
 
 def download_video_sync(url: str):
