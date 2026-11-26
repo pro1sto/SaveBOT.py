@@ -33,10 +33,9 @@ from aiogram.exceptions import (
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = 994444870
 
-# Список каналов для обязательной подписки (бот должен быть в них АДМИНИСТРАТОРОМ!)
 REQUIRED_CHANNELS = [
     {
-        "id": -1006003972835,
+        "id": --1006003972835,
         "url": "https://t.me/+afPTm145m0JhNjcy",
         "name": "ПОДПИСАТЬСЯ",
     },
@@ -324,3 +323,6 @@ async def handle_tiktok_link(message: types.Message):
 # ==============================
 
 class BroadcastState(StatesGroup):
+    waiting_for_post = State()
+
+
