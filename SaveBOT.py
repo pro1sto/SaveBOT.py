@@ -35,9 +35,11 @@ ADMIN_ID = 994444870
 
 # Список каналов для обязательной подписки (бот должен быть в них АДМИНИСТРАТОРОМ!)
 REQUIRED_CHANNELS = [
-    {"id": "@ваш_канал", "url": "https://t.me", "name": "Наш основной канал"},
-    # Можно добавить ещё каналы по аналогии:
-    # {"id": -1001234567890, "url": "https://t.me", "name": "Второй канал"},
+    {
+        "id": -1006003972835,
+        "url": "https://t.me/+afPTm145m0JhNjcy",
+        "name": "ПОДПИСАТЬСЯ",
+    },
 ]
 
 if not TOKEN:
@@ -58,7 +60,7 @@ is_sending = False
 
 
 # ==============================
-# 2. БАЗА ДАННЫХ (с сохранением старых пользователей)
+# 2. БАЗА ДАННЫХ
 # ==============================
 
 def init_db():
@@ -69,7 +71,6 @@ def init_db():
                 user_id INTEGER PRIMARY KEY
             )
         """)
-        # Мягко добавляем новые колонки в вашу существующую таблицу, если их ещё нет
         columns = [row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()]
         if "joined_at" not in columns:
             conn.execute("ALTER TABLE users ADD COLUMN joined_at TEXT")
@@ -155,7 +156,7 @@ def get_sub_keyboard() -> InlineKeyboardMarkup:
 # ==============================
 
 def get_tiktok_media_sync(url: str):
-    api_url = "https://www.tikwm.com/api/"
+    api_url = "https://tikwm.com"
     post_data = urllib.parse.urlencode({"url": url, "hd": 1}).encode("utf-8")
 
     req = urllib.request.Request(
@@ -163,7 +164,7 @@ def get_tiktok_media_sync(url: str):
         data=post_data,
         headers={
             "User-Agent": "Mozilla/5.0",
-            "Referer": "https://www.tikwm.com/",
+            "Referer": "https://tikwm.com",
             "Content-Type": "application/x-www-form-urlencoded",
         },
         method="POST",
@@ -184,7 +185,7 @@ def get_tiktok_media_sync(url: str):
 
         play_url = data.get("play")
         if play_url:
-            play_url = urllib.parse.urljoin("https://www.tikwm.com/", play_url)
+            play_url = urllib.parse.urljoin("https://tikwm.com", play_url)
             return {"type": "video", "url": play_url}
 
         logging.error("Медиа не найдено: %s", data)
@@ -201,7 +202,7 @@ def download_video_sync(url: str):
             url,
             headers={
                 "User-Agent": "Mozilla/5.0",
-                "Referer": "https://www.tiktok.com/",
+                "Referer": "https://tiktok.com",
             },
         )
 
@@ -277,12 +278,10 @@ async def handle_tiktok_link(message: types.Message):
         await status_msg.edit_text("❌ Не удалось получить медиа. Проверьте ссылку или попробуйте позже.")
         return
 
-    # Если это фото-слайдшоу
     if media["type"] == "images":
         try:
             await status_msg.edit_text("📤 Отправляю фото...")
             urls = media["urls"]
-            # Telegram позволяет отправлять до 10 фото в одном альбоме
             for i in range(0, len(urls), 10):
                 chunk = [InputMediaPhoto(media=u) for u in urls[i : i + 10]]
                 await message.answer_media_group(media=chunk)
@@ -293,7 +292,6 @@ async def handle_tiktok_link(message: types.Message):
             await status_msg.edit_text("❌ Не удалось отправить фотографии.")
         return
 
-    # Если это видео
     await status_msg.edit_text("⏳ Скачиваю видео...")
     video_path = await asyncio.to_thread(download_video_sync, media["url"])
 
@@ -313,3 +311,16 @@ async def handle_tiktok_link(message: types.Message):
         await message.answer_video(video=FSInputFile(video_path), caption="Готово! 📥")
         increment_downloads(message.from_user.id)
         await status_msg.delete()
+    except Exception as e:
+        logging.error(f"Ошибка отправки видео: {e}")
+        await status_msg.edit_text("❌ Не удалось отправить видео в Telegram.")
+    finally:
+        if os.path.exists(video_path):
+            os.remove(video_path)
+
+
+# ==============================
+# 6. АДМИН-ПАНЕЛЬ И РАССЫЛКА
+# ==============================
+
+class BroadcastState(StatesGroup):
