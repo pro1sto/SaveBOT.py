@@ -10,13 +10,7 @@ import urllib.parse
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import (
-    InputMediaPhoto,
-    FSInputFile,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    CallbackQuery,
-)
+from aiogram.types import InputMediaPhoto, FSInputFile
 from aiogram.exceptions import (
     TelegramRetryAfter,
     TelegramForbiddenError,
@@ -29,24 +23,6 @@ from aiogram.exceptions import (
 
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = 994444870
-
-# 1. КАНАЛЫ (идут первыми, подписка на них ПРОВЕРЯЕТСЯ)
-REQUIRED_CHANNELS = [
-    {
-        "id": -1006003972835,
-        "url": "https://t.me/+afPTm145m0JhNjcy",
-        "name": "ПОДПИСАТЬСЯ",
-    },
-]
-
-# 2. БОТЫ-СПОНСОРЫ (идут после каналов, БЕЗ проверки)
-SPONSOR_BOTS = [
-    {
-        "url": "https://t.me/InstTikTokSaveBot",
-        "name": "🤖 Нажать START",
-    },
-    # Можно добавить ещё ботов или оставить список пустым: SPONSOR_BOTS = []
-]
 
 if not TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN!")
@@ -114,57 +90,11 @@ def remove_users_bulk(user_ids):
 
 
 # ==============================
-# ПРОВЕРКА ПОДПИСКИ И КЛАВИАТУРА
-# ==============================
-
-async def check_subscription(user_id: int) -> bool:
-    if user_id == ADMIN_ID:
-        return True
-
-    # Проверяем только каналы
-    for channel in REQUIRED_CHANNELS:
-        try:
-            member = await bot.get_chat_member(
-                chat_id=channel["id"],
-                user_id=user_id
-            )
-            if member.status in ["left", "kicked"]:
-                return False
-        except Exception as e:
-            logging.error("Ошибка проверки подписки %s: %s", channel["id"], e)
-            continue
-
-    return True
-
-
-def get_sub_keyboard() -> InlineKeyboardMarkup:
-    buttons = []
-
-    # Сначала добавляем все каналы
-    for ch in REQUIRED_CHANNELS:
-        buttons.append(
-            [InlineKeyboardButton(text=f"📢 {ch['name']}", url=ch["url"])]
-        )
-
-    # Затем добавляем всех ботов (без проверки)
-    for b in SPONSOR_BOTS:
-        buttons.append(
-            [InlineKeyboardButton(text=b["name"], url=b["url"])]
-        )
-
-    # В самом низу кнопка проверки
-    buttons.append(
-        [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")]
-    )
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-# ==============================
 # 3. ПОЛУЧЕНИЕ TIKTOK МЕДИА
 # ==============================
 
 def get_tiktok_media_sync(url: str):
-    api_url = "https://tikwm.com"
+    api_url = "https://www.tikwm.com/api/"
 
     post_data = urllib.parse.urlencode({
         "url": url,
@@ -175,13 +105,9 @@ def get_tiktok_media_sync(url: str):
         api_url,
         data=post_data,
         headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Origin": "https://tikwm.com",
-            "Referer": "https://tikwm.com/",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "X-Requested-With": "XMLHttpRequest",
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://www.tikwm.com/",
+            "Content-Type": "application/x-www-form-urlencoded"
         },
         method="POST"
     )
@@ -198,54 +124,33 @@ def get_tiktok_media_sync(url: str):
 
         data = result.get("data") or {}
 
+        # Фото-слайдшоу
         if data.get("images"):
             return {
                 "type": "images",
                 "urls": data["images"]
             }
 
+        # Видео
         play_url = data.get("play")
+
         if play_url:
             play_url = urllib.parse.urljoin(
-                "https://tikwm.com/",
+                "https://www.tikwm.com/",
                 play_url
             )
+
             return {
                 "type": "video",
                 "url": play_url
             }
 
+        logging.error("Медиа не найдено: %s", data)
         return None
 
-    except Exception as e:
-        logging.warning("TikWM недоступен (%s), переключаюсь на yt-dlp", e)
-        return None
-
-
-def download_with_ytdlp_sync(url: str):
-    try:
-        import yt_dlp
-        temp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-        temp_path = temp.name
-        temp.close()
-        os.remove(temp_path)
-
-        ydl_opts = {
-            "outtmpl": temp_path,
-            "format": "best[ext=mp4]/best",
-            "quiet": True,
-            "no_warnings": True,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-
-        if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
-            return temp_path
-        return None
     except Exception:
-        logging.exception("Ошибка резервного yt-dlp")
+        logging.exception("Ошибка TikTok API")
         return None
-
 
 
 # ==============================
@@ -258,7 +163,7 @@ def download_video_sync(url: str):
             url,
             headers={
                 "User-Agent": "Mozilla/5.0",
-                "Referer": "https://tiktok.com"
+                "Referer": "https://www.tiktok.com/"
             }
         )
 
@@ -294,8 +199,9 @@ def download_video_sync(url: str):
         logging.exception("Ошибка скачивания видео")
         return None
 
+
 # ==============================
-# 5. КОМАНДА /START (БЕЗ ПРОВЕРКИ) И КНОПКА ПРОВЕРКИ
+# 5. КОМАНДА /START
 # ==============================
 
 @dp.message(CommandStart())
@@ -308,21 +214,6 @@ async def start_cmd(message: types.Message):
         "Я постараюсь скачать его и отправить тебе!",
         parse_mode="HTML"
     )
-
-
-@dp.callback_query(F.data == "check_sub")
-async def check_sub_callback(callback: CallbackQuery):
-    if await check_subscription(callback.from_user.id):
-        await callback.message.edit_text(
-            "✅ <b>Спасибо за подписку!</b>\n\n"
-            "Теперь отправь ссылку на видео или фото-пост TikTok ещё раз.",
-            parse_mode="HTML"
-        )
-    else:
-        await callback.answer(
-            "❌ Вы ещё не подписались на каналы!",
-            show_alert=True
-        )
 
 
 # ==============================
@@ -452,78 +343,154 @@ async def send_cmd(message: types.Message):
         remove_users_bulk(dead_batch)
         is_sending = False
 
-    await status_msg.edit_text(
-        f"✅ Рассылка завершена!\n\n"
+    await message.answer(
+        "✅ <b>Рассылка завершена!</b>\n\n"
         f"📨 Доставлено: {success}\n"
-        f"🗑 Удалено из базы: {removed}"
+        f"🗑 Удалено: {removed}\n"
+        f"📊 Пользователей в базе: {get_users_count()}",
+        parse_mode="HTML"
     )
 
 
 # ==============================
-# 9. ОБРАБОТКА ССЫЛОК TIKTOK (С ПРОВЕРКОЙ ПОДПИСКИ)
+# 9. ОБРАБОТКА ССЫЛОК TIKTOK
 # ==============================
 
-@dp.message(F.text.contains("tiktok.com"))
-async def tiktok_handler(message: types.Message):
+@dp.message(F.text)
+async def handle_link(message: types.Message):
     add_user(message.from_user.id)
 
-    if not await check_subscription(message.from_user.id):
-        await message.answer(
-            "🔒 <b>Для скачивания подпишитесь на спонсоров:</b>",
-            reply_markup=get_sub_keyboard(),
-            parse_mode="HTML"
-        )
-        return
-
     url = message.text.strip()
-    status_msg = await message.answer("⏳ Скачиваю, подождите...")
 
-    media = await asyncio.to_thread(get_tiktok_media_sync, url)
+    parsed = urllib.parse.urlparse(url)
 
-    if not media:
-        await status_msg.edit_text(
-            "❌ Не удалось скачать. Проверьте ссылку или попробуйте позже."
+    allowed_domains = {
+        "tiktok.com",
+        "www.tiktok.com",
+        "vm.tiktok.com",
+        "vt.tiktok.com"
+    }
+
+    if (
+        parsed.scheme not in ("http", "https")
+        or parsed.hostname not in allowed_domains
+    ):
+        await message.answer(
+            "⚠️ Пожалуйста, отправь ссылку на TikTok."
         )
         return
 
-    if media["type"] == "images":
-        try:
-            urls = media["urls"]
-            for i in range(0, len(urls), 10):
-                chunk = [InputMediaPhoto(media=u) for u in urls[i:i + 10]]
-                await message.answer_media_group(media=chunk)
-            await status_msg.delete()
-        except Exception:
-            logging.exception("Ошибка отправки фото")
-            await status_msg.edit_text("❌ Не удалось отправить фото.")
+    status_msg = await message.answer(
+        "⚡ Получаю данные TikTok..."
+    )
+
+    tt_data = await asyncio.to_thread(
+        get_tiktok_media_sync,
+        url
+    )
+
+    if not tt_data:
+        await status_msg.edit_text(
+            "❌ Не удалось получить медиа.\n\n"
+            "Возможно, ролик удалён, закрыт "
+            "или сервис загрузки временно недоступен."
+        )
         return
 
-    video_path = await asyncio.to_thread(download_video_sync, media["url"])
-
-    if not video_path:
-        await status_msg.edit_text("❌ Не удалось загрузить видеофайл.")
-        return
+    temp_path = None
 
     try:
-        video = FSInputFile(video_path)
-        await message.answer_video(video=video)
+        if tt_data["type"] == "images":
+
+            photos = tt_data["urls"]
+
+            if not photos:
+                raise ValueError("Список фотографий пуст")
+
+            for idx in range(0, len(photos), 10):
+                media_group = [
+                    InputMediaPhoto(media=p)
+                    for p in photos[idx:idx + 10]
+                ]
+
+                await message.answer_media_group(
+                    media=media_group
+                )
+
+        elif tt_data["type"] == "video":
+
+            await status_msg.edit_text(
+                "📥 Скачиваю видео..."
+            )
+
+            temp_path = await asyncio.to_thread(
+                download_video_sync,
+                tt_data["url"]
+            )
+
+            if not temp_path:
+                await status_msg.edit_text(
+                    "❌ Не удалось скачать видео."
+                )
+                return
+
+            await status_msg.edit_text(
+                "📤 Отправляю видео в Telegram..."
+            )
+
+            video = FSInputFile(
+                temp_path,
+                filename="tiktok_video.mp4"
+            )
+
+            await message.answer_video(
+                video=video,
+                supports_streaming=True,
+                caption="✅ Видео скачано!"
+            )
+
         await status_msg.delete()
+
     except Exception:
-        logging.exception("Ошибка отправки видео")
-        await status_msg.edit_text("❌ Не удалось отправить видео в Telegram.")
+        logging.exception("Ошибка отправки медиа")
+
+        try:
+            await status_msg.edit_text(
+                "❌ Ошибка отправки файла.\n"
+                "Возможно, видео слишком большое "
+                "или Telegram не поддерживает его формат."
+            )
+        except Exception:
+            pass
+
     finally:
-        if os.path.exists(video_path):
-            os.remove(video_path)
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
 # ==============================
-# 10. ЗАПУСК
+# 10. ЗАПУСК БОТА
 # ==============================
 
 async def main():
     init_db()
-    await dp.start_polling(bot)
+
+    await bot.delete_webhook(
+        drop_pending_updates=True
+    )
+
+    logging.info("TikTok Downloader запущен!")
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+        logging.info("Бот остановлен.")
+
