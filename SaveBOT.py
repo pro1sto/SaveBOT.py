@@ -175,9 +175,13 @@ def get_tiktok_media_sync(url: str):
         api_url,
         data=post_data,
         headers={
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://tikwm.com",
-            "Content-Type": "application/x-www-form-urlencoded"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Origin": "https://tikwm.com",
+            "Referer": "https://tikwm.com/",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
         },
         method="POST"
     )
@@ -194,33 +198,54 @@ def get_tiktok_media_sync(url: str):
 
         data = result.get("data") or {}
 
-        # Фото-слайдшоу
         if data.get("images"):
             return {
                 "type": "images",
                 "urls": data["images"]
             }
 
-        # Видео
         play_url = data.get("play")
-
         if play_url:
             play_url = urllib.parse.urljoin(
-                "https://tikwm.com",
+                "https://tikwm.com/",
                 play_url
             )
-
             return {
                 "type": "video",
                 "url": play_url
             }
 
-        logging.error("Медиа не найдено: %s", data)
         return None
 
-    except Exception:
-        logging.exception("Ошибка TikTok API")
+    except Exception as e:
+        logging.warning("TikWM недоступен (%s), переключаюсь на yt-dlp", e)
         return None
+
+
+def download_with_ytdlp_sync(url: str):
+    try:
+        import yt_dlp
+        temp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        temp_path = temp.name
+        temp.close()
+        os.remove(temp_path)
+
+        ydl_opts = {
+            "outtmpl": temp_path,
+            "format": "best[ext=mp4]/best",
+            "quiet": True,
+            "no_warnings": True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+            return temp_path
+        return None
+    except Exception:
+        logging.exception("Ошибка резервного yt-dlp")
+        return None
+
 
 
 # ==============================
