@@ -1,4 +1,3 @@
-
 import os
 import json
 import asyncio
@@ -8,14 +7,23 @@ import tempfile
 import shutil
 import urllib.request
 import urllib.parse
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import InputMediaPhoto, FSInputFile
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    InputMediaPhoto,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    CallbackQuery,
+)
 from aiogram.exceptions import (
     TelegramRetryAfter,
     TelegramForbiddenError,
-    TelegramBadRequest
+    TelegramBadRequest,
 )
 
 # ==============================
@@ -25,12 +33,19 @@ from aiogram.exceptions import (
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = 994444870
 
+# Список каналов для обязательной подписки (бот должен быть в них АДМИНИСТРАТОРОМ!)
+REQUIRED_CHANNELS = [
+    {"id": "@ваш_канал", "url": "https://t.me", "name": "Наш основной канал"},
+    # Можно добавить ещё каналы по аналогии:
+    # {"id": -1001234567890, "url": "https://t.me", "name": "Второй канал"},
+]
+
 if not TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN!")
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
 bot = Bot(token=TOKEN)
@@ -43,7 +58,7 @@ is_sending = False
 
 
 # ==============================
-# 2. БАЗА ДАННЫХ
+# 2. БАЗА ДАННЫХ (с сохранением старых пользователей)
 # ==============================
 
 def init_db():
@@ -54,53 +69,94 @@ def init_db():
                 user_id INTEGER PRIMARY KEY
             )
         """)
+        # Мягко добавляем новые колонки в вашу существующую таблицу, если их ещё нет
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()]
+        if "joined_at" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN joined_at TEXT")
+        if "downloads" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN downloads INTEGER DEFAULT 0")
 
 
 def add_user(user_id: int):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
-            (user_id,)
+            "INSERT OR IGNORE INTO users (user_id, joined_at, downloads) VALUES (?, ?, 0)",
+            (user_id, datetime.now().isoformat()),
         )
 
 
-def get_users_count():
+def increment_downloads(user_id: int):
     with sqlite3.connect(DB_PATH) as conn:
-        return conn.execute(
-            "SELECT COUNT(*) FROM users"
+        conn.execute(
+            "UPDATE users SET downloads = COALESCE(downloads, 0) + 1 WHERE user_id = ?",
+            (user_id,),
+        )
+
+
+def get_stats():
+    with sqlite3.connect(DB_PATH) as conn:
+        total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        yesterday = (datetime.now() - timedelta(days=1)).isoformat()
+        new_today = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE joined_at >= ?", (yesterday,)
         ).fetchone()[0]
+        total_downloads = (
+            conn.execute("SELECT SUM(downloads) FROM users").fetchone()[0] or 0
+        )
+        return total_users, new_today, total_downloads
 
 
 def get_all_users():
     with sqlite3.connect(DB_PATH) as conn:
-        return [
-            row[0]
-            for row in conn.execute("SELECT user_id FROM users")
-        ]
+        return [row[0] for row in conn.execute("SELECT user_id FROM users").fetchall()]
 
 
 def remove_users_bulk(user_ids):
     if not user_ids:
         return
-
     with sqlite3.connect(DB_PATH) as conn:
         conn.executemany(
             "DELETE FROM users WHERE user_id = ?",
-            [(uid,) for uid in user_ids]
+            [(uid,) for uid in user_ids],
         )
 
 
 # ==============================
-# 3. ПОЛУЧЕНИЕ TIKTOK МЕДИА
+# 3. ОБЯЗАТЕЛЬНАЯ ПОДПИСКА
+# ==============================
+
+async def check_subscription(user_id: int) -> bool:
+    if user_id == ADMIN_ID:
+        return True
+    for channel in REQUIRED_CHANNELS:
+        try:
+            member = await bot.get_chat_member(chat_id=channel["id"], user_id=user_id)
+            if member.status in ["left", "kicked"]:
+                return False
+        except Exception as e:
+            logging.error(f"Ошибка проверки канала {channel['id']}: {e}")
+            continue
+    return True
+
+
+def get_sub_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text=f"📢 {ch['name']}", url=ch["url"])]
+        for ch in REQUIRED_CHANNELS
+    ]
+    buttons.append(
+        [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+# ==============================
+# 4. ПОЛУЧЕНИЕ И СКАЧИВАНИЕ TIKTOK МЕДИА
 # ==============================
 
 def get_tiktok_media_sync(url: str):
     api_url = "https://www.tikwm.com/api/"
-
-    post_data = urllib.parse.urlencode({
-        "url": url,
-        "hd": 1
-    }).encode("utf-8")
+    post_data = urllib.parse.urlencode({"url": url, "hd": 1}).encode("utf-8")
 
     req = urllib.request.Request(
         api_url,
@@ -108,16 +164,14 @@ def get_tiktok_media_sync(url: str):
         headers={
             "User-Agent": "Mozilla/5.0",
             "Referer": "https://www.tikwm.com/",
-            "Content-Type": "application/x-www-form-urlencoded"
+            "Content-Type": "application/x-www-form-urlencoded",
         },
-        method="POST"
+        method="POST",
     )
 
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
-            result = json.loads(
-                response.read().decode("utf-8")
-            )
+            result = json.loads(response.read().decode("utf-8"))
 
         if result.get("code") != 0:
             logging.error("TikWM error: %s", result)
@@ -125,26 +179,13 @@ def get_tiktok_media_sync(url: str):
 
         data = result.get("data") or {}
 
-        # Фото-слайдшоу
         if data.get("images"):
-            return {
-                "type": "images",
-                "urls": data["images"]
-            }
+            return {"type": "images", "urls": data["images"]}
 
-        # Видео
         play_url = data.get("play")
-
         if play_url:
-            play_url = urllib.parse.urljoin(
-                "https://www.tikwm.com/",
-                play_url
-            )
-
-            return {
-                "type": "video",
-                "url": play_url
-            }
+            play_url = urllib.parse.urljoin("https://www.tikwm.com/", play_url)
+            return {"type": "video", "url": play_url}
 
         logging.error("Медиа не найдено: %s", data)
         return None
@@ -154,39 +195,22 @@ def get_tiktok_media_sync(url: str):
         return None
 
 
-# ==============================
-# 4. СКАЧИВАНИЕ ВИДЕО
-# ==============================
-
 def download_video_sync(url: str):
     try:
         req = urllib.request.Request(
             url,
             headers={
                 "User-Agent": "Mozilla/5.0",
-                "Referer": "https://www.tiktok.com/"
-            }
+                "Referer": "https://www.tiktok.com/",
+            },
         )
 
         with urllib.request.urlopen(req, timeout=60) as response:
-            content_type = response.headers.get(
-                "Content-Type", ""
-            ).lower()
+            content_type = response.headers.get("Content-Type", "").lower()
+            if "video" not in content_type and "octet-stream" not in content_type:
+                logging.warning("Неожиданный тип файла: %s", content_type)
 
-            if (
-                "video" not in content_type
-                and "octet-stream" not in content_type
-            ):
-                logging.warning(
-                    "Неожиданный тип файла: %s",
-                    content_type
-                )
-
-            temp = tempfile.NamedTemporaryFile(
-                suffix=".mp4",
-                delete=False
-            )
-
+            temp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
             with temp:
                 shutil.copyfileobj(response, temp)
 
@@ -202,295 +226,90 @@ def download_video_sync(url: str):
 
 
 # ==============================
-# 5. КОМАНДА /START
+# 5. ПОЛЬЗОВАТЕЛЬСКИЕ ОБРАБОТЧИКИ
 # ==============================
 
 @dp.message(CommandStart())
 async def start_cmd(message: types.Message):
     add_user(message.from_user.id)
 
+    if not await check_subscription(message.from_user.id):
+        await message.answer(
+            "👋 Привет! Чтобы пользоваться ботом, подпишись на наши каналы:",
+            reply_markup=get_sub_keyboard(),
+        )
+        return
+
     await message.answer(
         "📥 <b>Бот для скачивания видео из TikTok</b>\n\n"
-        "Отправь ссылку на видео или фото-пост TikTok.\n\n"
+        "Отправь ссылку на видео или фото-пост TikTok.\n"
         "Я постараюсь скачать его и отправить тебе!",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
 
-# ==============================
-# 6. СТАТИСТИКА
-# ==============================
-
-@dp.message(Command("stats"))
-async def stats_cmd(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    await message.answer(
-        f"📊 Живых пользователей в базе: <b>{get_users_count()}</b>",
-        parse_mode="HTML"
-    )
-
-
-# ==============================
-# 7. ОСТАНОВКА РАССЫЛКИ
-# ==============================
-
-@dp.message(Command("stop_send"))
-async def stop_send_cmd(message: types.Message):
-    global is_sending
-
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    is_sending = False
-
-    await message.answer("🛑 Останавливаю рассылку...")
-
-
-# ==============================
-# 8. РАССЫЛКА
-# ==============================
-
-@dp.message(Command("send"))
-async def send_cmd(message: types.Message):
-    global is_sending
-
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    if is_sending:
-        await message.answer("⚠️ Рассылка уже запущена!")
-        return
-
-    text_to_send = message.text.replace(
-        "/send", "", 1
-    ).strip()
-
-    if not text_to_send:
-        await message.answer(
-            "❗ Напиши текст после команды.\n"
-            "Пример: /send Бот снова работает!"
+@dp.callback_query(F.data == "check_sub")
+async def callback_check_sub(callback: CallbackQuery):
+    if await check_subscription(callback.from_user.id):
+        await callback.message.edit_text(
+            "✅ Спасибо за подписку! Теперь отправь ссылку на видео или фото-пост TikTok."
         )
-        return
-
-    users = get_all_users()
-    total = len(users)
-
-    status_msg = await message.answer(
-        f"🚀 Запускаю рассылку по {total} пользователям..."
-    )
-
-    is_sending = True
-
-    success = 0
-    removed = 0
-    dead_batch = []
-
-    try:
-        for i, uid in enumerate(users, start=1):
-
-            if not is_sending:
-                break
-
-            try:
-                await bot.send_message(
-                    chat_id=uid,
-                    text=text_to_send
-                )
-                success += 1
-
-            except TelegramRetryAfter as e:
-                await asyncio.sleep(e.retry_after)
-
-                try:
-                    await bot.send_message(
-                        chat_id=uid,
-                        text=text_to_send
-                    )
-                    success += 1
-                except Exception:
-                    dead_batch.append(uid)
-                    removed += 1
-
-            except (
-                TelegramForbiddenError,
-                TelegramBadRequest
-            ):
-                dead_batch.append(uid)
-                removed += 1
-
-            except Exception:
-                logging.exception(
-                    "Ошибка рассылки пользователю %s", uid
-                )
-
-            await asyncio.sleep(0.05)
-
-            if i % 100 == 0:
-                remove_users_bulk(dead_batch)
-                dead_batch.clear()
-
-                try:
-                    await status_msg.edit_text(
-                        f"⏳ Рассылка: {i}/{total}\n"
-                        f"📨 Доставлено: {success}\n"
-                        f"🗑 Удалено: {removed}"
-                    )
-                except TelegramBadRequest:
-                    pass
-
-    finally:
-        remove_users_bulk(dead_batch)
-        is_sending = False
-
-    await message.answer(
-        "✅ <b>Рассылка завершена!</b>\n\n"
-        f"📨 Доставлено: {success}\n"
-        f"🗑 Удалено: {removed}\n"
-        f"📊 Пользователей в базе: {get_users_count()}",
-        parse_mode="HTML"
-    )
+    else:
+        await callback.answer("❌ Вы подписались не на все каналы!", show_alert=True)
 
 
-# ==============================
-# 9. ОБРАБОТКА ССЫЛОК TIKTOK
-# ==============================
-
-@dp.message(F.text)
-async def handle_link(message: types.Message):
+@dp.message(F.text.regexp(r"https?://(www\.|vm\.|vt\.)?tiktok\.com/"))
+async def handle_tiktok_link(message: types.Message):
     add_user(message.from_user.id)
 
-    url = message.text.strip()
-
-    parsed = urllib.parse.urlparse(url)
-
-    allowed_domains = {
-        "tiktok.com",
-        "www.tiktok.com",
-        "vm.tiktok.com",
-        "vt.tiktok.com"
-    }
-
-    if (
-        parsed.scheme not in ("http", "https")
-        or parsed.hostname not in allowed_domains
-    ):
+    if not await check_subscription(message.from_user.id):
         await message.answer(
-            "⚠️ Пожалуйста, отправь ссылку на TikTok."
+            "🔒 Для скачивания необходимо подписаться на каналы:",
+            reply_markup=get_sub_keyboard(),
         )
         return
 
-    status_msg = await message.answer(
-        "⚡ Получаю данные TikTok..."
-    )
+    url = message.text.strip()
+    status_msg = await message.answer("⏳ Получаю данные из TikTok...")
 
-    tt_data = await asyncio.to_thread(
-        get_tiktok_media_sync,
-        url
-    )
-
-    if not tt_data:
-        await status_msg.edit_text(
-            "❌ Не удалось получить медиа.\n\n"
-            "Возможно, ролик удалён, закрыт "
-            "или сервис загрузки временно недоступен."
-        )
+    media = await asyncio.to_thread(get_tiktok_media_sync, url)
+    if not media:
+        await status_msg.edit_text("❌ Не удалось получить медиа. Проверьте ссылку или попробуйте позже.")
         return
 
-    temp_path = None
-
-    try:
-        if tt_data["type"] == "images":
-
-            photos = tt_data["urls"]
-
-            if not photos:
-                raise ValueError("Список фотографий пуст")
-
-            for idx in range(0, len(photos), 10):
-                media_group = [
-                    InputMediaPhoto(media=p)
-                    for p in photos[idx:idx + 10]
-                ]
-
-                await message.answer_media_group(
-                    media=media_group
-                )
-
-        elif tt_data["type"] == "video":
-
-            await status_msg.edit_text(
-                "📥 Скачиваю видео..."
-            )
-
-            temp_path = await asyncio.to_thread(
-                download_video_sync,
-                tt_data["url"]
-            )
-
-            if not temp_path:
-                await status_msg.edit_text(
-                    "❌ Не удалось скачать видео."
-                )
-                return
-
-            await status_msg.edit_text(
-                "📤 Отправляю видео в Telegram..."
-            )
-
-            video = FSInputFile(
-                temp_path,
-                filename="tiktok_video.mp4"
-            )
-
-            await message.answer_video(
-                video=video,
-                supports_streaming=True,
-                caption="✅ Видео скачано!"
-            )
-
-        await status_msg.delete()
-
-    except Exception:
-        logging.exception("Ошибка отправки медиа")
-
+    # Если это фото-слайдшоу
+    if media["type"] == "images":
         try:
+            await status_msg.edit_text("📤 Отправляю фото...")
+            urls = media["urls"]
+            # Telegram позволяет отправлять до 10 фото в одном альбоме
+            for i in range(0, len(urls), 10):
+                chunk = [InputMediaPhoto(media=u) for u in urls[i : i + 10]]
+                await message.answer_media_group(media=chunk)
+            increment_downloads(message.from_user.id)
+            await status_msg.delete()
+        except Exception as e:
+            logging.error(f"Ошибка отправки фото: {e}")
+            await status_msg.edit_text("❌ Не удалось отправить фотографии.")
+        return
+
+    # Если это видео
+    await status_msg.edit_text("⏳ Скачиваю видео...")
+    video_path = await asyncio.to_thread(download_video_sync, media["url"])
+
+    if not video_path:
+        await status_msg.edit_text("❌ Ошибка при загрузке видеофайла.")
+        return
+
+    try:
+        file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+        if file_size_mb > 49.5:
             await status_msg.edit_text(
-                "❌ Ошибка отправки файла.\n"
-                "Возможно, видео слишком большое "
-                "или Telegram не поддерживает его формат."
+                f"❌ Видео весит {file_size_mb:.1f} МБ. Лимит Telegram для ботов — 50 МБ."
             )
-        except Exception:
-            pass
+            return
 
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
-
-
-# ==============================
-# 10. ЗАПУСК БОТА
-# ==============================
-
-async def main():
-    init_db()
-
-    await bot.delete_webhook(
-        drop_pending_updates=True
-    )
-
-    logging.info("TikTok Downloader запущен!")
-
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-
-    except KeyboardInterrupt:
-        logging.info("Бот остановлен.")
+        await status_msg.edit_text("📤 Отправляю видео...")
+        await message.answer_video(video=FSInputFile(video_path), caption="Готово! 📥")
+        increment_downloads(message.from_user.id)
+        await status_msg.delete()
