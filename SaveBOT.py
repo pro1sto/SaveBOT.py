@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import asyncio
 import logging
 import sqlite3
@@ -10,7 +11,11 @@ import urllib.parse
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import InputMediaPhoto, FSInputFile
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import InputMediaPhoto, FSInputFile, InlineKeyboardMarkup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import (
     TelegramRetryAfter,
     TelegramForbiddenError,
@@ -33,12 +38,16 @@ logging.basicConfig(
 )
 
 bot = Bot(token=TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "downloader_users.db")
 
 is_sending = False
+
+
+class AdminStates(StatesGroup):
+    waiting_for_broadcast = State()
 
 
 # ==============================
@@ -50,24 +59,55 @@ def init_db():
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY
+                user_id INTEGER PRIMARY KEY,
+                joined_at INTEGER DEFAULT 0
             )
         """)
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN joined_at INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS stats (
+                key TEXT PRIMARY KEY,
+                value INTEGER DEFAULT 0
+            )
+        """)
+        conn.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('downloads', 0)")
 
 
 def add_user(user_id: int):
+    now = int(time.time())
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
-            (user_id,)
+            "INSERT OR IGNORE INTO users (user_id, joined_at) VALUES (?, ?)",
+            (user_id, now)
         )
+
+
+def increment_downloads():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE stats SET value = value + 1 WHERE key = 'downloads'")
 
 
 def get_users_count():
     with sqlite3.connect(DB_PATH) as conn:
-        return conn.execute(
-            "SELECT COUNT(*) FROM users"
+        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+
+def get_bot_stats():
+    day_ago = int(time.time()) - 86400
+    with sqlite3.connect(DB_PATH) as conn:
+        total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        new_24h = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE joined_at >= ?",
+            (day_ago,)
         ).fetchone()[0]
+        downloads = conn.execute(
+            "SELECT value FROM stats WHERE key = 'downloads'"
+        ).fetchone()[0]
+    return total_users, new_24h, downloads
 
 
 def get_all_users():
@@ -90,7 +130,41 @@ def remove_users_bulk(user_ids):
 
 
 # ==============================
-# 3. ПОЛУЧЕНИЕ TIKTOK МЕДИА
+# 3. КЛАВИАТУРЫ И ТЕКСТ АДМИНКИ
+# ==============================
+
+def get_admin_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📊 Статистика", callback_data="admin_stats")
+    builder.button(text="✉️ Сделать рассылку", callback_data="admin_broadcast")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_cancel_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ Отмена", callback_data="admin_cancel")
+    return builder.as_markup()
+
+
+def get_stop_sending_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🛑 Остановить рассылку", callback_data="admin_stop_send")
+    return builder.as_markup()
+
+
+def build_stats_text() -> str:
+    total, new_24h, downloads = get_bot_stats()
+    return (
+        "📊 <b>Статистика бота:</b>\n\n"
+        f"👥 Всего пользователей: <b>{total}</b>\n"
+        f"🆕 Новых за 24 часа: <b>{new_24h}</b>\n"
+        f"📥 Скачано видео: <b>{downloads}</b>"
+    )
+
+
+# ==============================
+# 4. ПОЛУЧЕНИЕ TIKTOK МЕДИА
 # ==============================
 
 def get_tiktok_media_sync(url: str):
@@ -154,7 +228,7 @@ def get_tiktok_media_sync(url: str):
 
 
 # ==============================
-# 4. СКАЧИВАНИЕ ВИДЕО
+# 5. СКАЧИВАНИЕ ВИДЕО
 # ==============================
 
 def download_video_sync(url: str):
@@ -201,7 +275,7 @@ def download_video_sync(url: str):
 
 
 # ==============================
-# 5. КОМАНДА /START
+# 6. КОМАНДА /START
 # ==============================
 
 @dp.message(CommandStart())
@@ -217,23 +291,87 @@ async def start_cmd(message: types.Message):
 
 
 # ==============================
-# 6. СТАТИСТИКА
+# 7. АДМИН-МЕНЮ И СТАТИСТИКА
 # ==============================
 
-@dp.message(Command("stats"))
-async def stats_cmd(message: types.Message):
+@dp.message(Command("admin", "stats"))
+async def admin_menu_cmd(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
 
+    await state.clear()
     await message.answer(
-        f"📊 Живых пользователей в базе: <b>{get_users_count()}</b>",
+        build_stats_text(),
+        reply_markup=get_admin_keyboard(),
         parse_mode="HTML"
     )
 
 
+@dp.callback_query(F.data == "admin_stats")
+async def cb_admin_stats(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+
+    try:
+        await callback.message.edit_text(
+            build_stats_text(),
+            reply_markup=get_admin_keyboard(),
+            parse_mode="HTML"
+        )
+    except TelegramBadRequest:
+        pass
+
+    await callback.answer("Статистика обновлена")
+
+
 # ==============================
-# 7. ОСТАНОВКА РАССЫЛКИ
+# 8. РАССЫЛКА ЧЕРЕЗ КНОПКИ И FSM
 # ==============================
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def cb_admin_broadcast(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+
+    if is_sending:
+        await callback.answer("⚠️ Рассылка уже запущена!", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_broadcast)
+    await callback.message.edit_text(
+        "✉️ <b>Создание рассылки</b>\n\n"
+        "Отправьте сообщение, которое нужно разослать всем пользователям.\n"
+        "<i>Поддерживается текст, фото, видео, GIF и голосовые.</i>",
+        reply_markup=get_cancel_keyboard(),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_cancel")
+async def cb_admin_cancel(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+
+    await state.clear()
+    await callback.message.edit_text(
+        build_stats_text(),
+        reply_markup=get_admin_keyboard(),
+        parse_mode="HTML"
+    )
+    await callback.answer("Отменено")
+
+
+@dp.callback_query(F.data == "admin_stop_send")
+async def cb_admin_stop_send(callback: types.CallbackQuery):
+    global is_sending
+
+    if callback.from_user.id != ADMIN_ID:
+        return
+
+    is_sending = False
+    await callback.answer("🛑 Останавливаю рассылку...", show_alert=True)
+
 
 @dp.message(Command("stop_send"))
 async def stop_send_cmd(message: types.Message):
@@ -243,86 +381,57 @@ async def stop_send_cmd(message: types.Message):
         return
 
     is_sending = False
-
     await message.answer("🛑 Останавливаю рассылку...")
 
 
-# ==============================
-# 8. РАССЫЛКА
-# ==============================
-
-@dp.message(Command("send"))
-async def send_cmd(message: types.Message):
+@dp.message(AdminStates.waiting_for_broadcast, F.from_user.id == ADMIN_ID)
+async def process_broadcast_message(message: types.Message, state: FSMContext):
     global is_sending
 
-    if message.from_user.id != ADMIN_ID:
-        return
+    await state.clear()
 
     if is_sending:
         await message.answer("⚠️ Рассылка уже запущена!")
-        return
-
-    text_to_send = message.text.replace(
-        "/send", "", 1
-    ).strip()
-
-    if not text_to_send:
-        await message.answer(
-            "❗ Напиши текст после команды.\n"
-            "Пример: /send Бот снова работает!"
-        )
         return
 
     users = get_all_users()
     total = len(users)
 
     status_msg = await message.answer(
-        f"🚀 Запускаю рассылку по {total} пользователям..."
+        f"🚀 Запускаю рассылку по <b>{total}</b> пользователям...",
+        reply_markup=get_stop_sending_keyboard(),
+        parse_mode="HTML"
     )
 
     is_sending = True
-
     success = 0
     removed = 0
     dead_batch = []
 
     try:
         for i, uid in enumerate(users, start=1):
-
             if not is_sending:
                 break
 
             try:
-                await bot.send_message(
-                    chat_id=uid,
-                    text=text_to_send
-                )
+                await message.copy_to(chat_id=uid)
                 success += 1
 
             except TelegramRetryAfter as e:
                 await asyncio.sleep(e.retry_after)
-
                 try:
-                    await bot.send_message(
-                        chat_id=uid,
-                        text=text_to_send
-                    )
+                    await message.copy_to(chat_id=uid)
                     success += 1
                 except Exception:
                     dead_batch.append(uid)
                     removed += 1
 
-            except (
-                TelegramForbiddenError,
-                TelegramBadRequest
-            ):
+            except (TelegramForbiddenError, TelegramBadRequest):
                 dead_batch.append(uid)
                 removed += 1
 
             except Exception:
-                logging.exception(
-                    "Ошибка рассылки пользователю %s", uid
-                )
+                logging.exception("Ошибка рассылки пользователю %s", uid)
 
             await asyncio.sleep(0.05)
 
@@ -332,9 +441,11 @@ async def send_cmd(message: types.Message):
 
                 try:
                     await status_msg.edit_text(
-                        f"⏳ Рассылка: {i}/{total}\n"
-                        f"📨 Доставлено: {success}\n"
-                        f"🗑 Удалено: {removed}"
+                        f"⏳ Рассылка: <b>{i}/{total}</b>\n"
+                        f"📨 Доставлено: <b>{success}</b>\n"
+                        f"🗑 Удалено: <b>{removed}</b>",
+                        reply_markup=get_stop_sending_keyboard(),
+                        parse_mode="HTML"
                     )
                 except TelegramBadRequest:
                     pass
@@ -343,11 +454,12 @@ async def send_cmd(message: types.Message):
         remove_users_bulk(dead_batch)
         is_sending = False
 
-    await message.answer(
+    await status_msg.edit_text(
         "✅ <b>Рассылка завершена!</b>\n\n"
-        f"📨 Доставлено: {success}\n"
-        f"🗑 Удалено: {removed}\n"
-        f"📊 Пользователей в базе: {get_users_count()}",
+        f"📨 Доставлено: <b>{success}</b>\n"
+        f"🗑 Удалено: <b>{removed}</b>\n"
+        f"📊 Пользователей в базе: <b>{get_users_count()}</b>",
+        reply_markup=get_admin_keyboard(),
         parse_mode="HTML"
     )
 
@@ -361,7 +473,6 @@ async def handle_link(message: types.Message):
     add_user(message.from_user.id)
 
     url = message.text.strip()
-
     parsed = urllib.parse.urlparse(url)
 
     allowed_domains = {
@@ -375,19 +486,12 @@ async def handle_link(message: types.Message):
         parsed.scheme not in ("http", "https")
         or parsed.hostname not in allowed_domains
     ):
-        await message.answer(
-            "⚠️ Пожалуйста, отправь ссылку на TikTok."
-        )
+        await message.answer("⚠️ Пожалуйста, отправь ссылку на TikTok.")
         return
 
-    status_msg = await message.answer(
-        "⚡ Получаю данные TikTok..."
-    )
+    status_msg = await message.answer("⚡ Получаю данные TikTok...")
 
-    tt_data = await asyncio.to_thread(
-        get_tiktok_media_sync,
-        url
-    )
+    tt_data = await asyncio.to_thread(get_tiktok_media_sync, url)
 
     if not tt_data:
         await status_msg.edit_text(
@@ -401,7 +505,6 @@ async def handle_link(message: types.Message):
 
     try:
         if tt_data["type"] == "images":
-
             photos = tt_data["urls"]
 
             if not photos:
@@ -412,16 +515,12 @@ async def handle_link(message: types.Message):
                     InputMediaPhoto(media=p)
                     for p in photos[idx:idx + 10]
                 ]
+                await message.answer_media_group(media=media_group)
 
-                await message.answer_media_group(
-                    media=media_group
-                )
+            increment_downloads()
 
         elif tt_data["type"] == "video":
-
-            await status_msg.edit_text(
-                "📥 Скачиваю видео..."
-            )
+            await status_msg.edit_text("📥 Скачиваю видео...")
 
             temp_path = await asyncio.to_thread(
                 download_video_sync,
@@ -429,25 +528,20 @@ async def handle_link(message: types.Message):
             )
 
             if not temp_path:
-                await status_msg.edit_text(
-                    "❌ Не удалось скачать видео."
-                )
+                await status_msg.edit_text("❌ Не удалось скачать видео.")
                 return
 
-            await status_msg.edit_text(
-                "📤 Отправляю видео в Telegram..."
-            )
+            await status_msg.edit_text("📤 Отправляю видео в Telegram...")
 
-            video = FSInputFile(
-                temp_path,
-                filename="tiktok_video.mp4"
-            )
+            video = FSInputFile(temp_path, filename="tiktok_video.mp4")
 
             await message.answer_video(
                 video=video,
                 supports_streaming=True,
                 caption="✅ Видео скачано!"
             )
+
+            increment_downloads()
 
         await status_msg.delete()
 
@@ -475,9 +569,7 @@ async def handle_link(message: types.Message):
 async def main():
     init_db()
 
-    await bot.delete_webhook(
-        drop_pending_updates=True
-    )
+    await bot.delete_webhook(drop_pending_updates=True)
 
     logging.info("TikTok Downloader запущен!")
 
@@ -490,7 +582,5 @@ async def main():
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-
     except KeyboardInterrupt:
         logging.info("Бот остановлен.")
-
